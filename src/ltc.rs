@@ -221,3 +221,37 @@ pub(crate) fn timezone_index(name: &str) -> Option<usize> {
         .iter()
         .position(|timezone| timezone.to_string() == name)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generates_one_ltc_frame_at_25_fps() {
+        let fps = SelectedFps::Fps25;
+        let mut generator = LtcBiphaseMarkGenerator::new(48_000, fps);
+        let mut frame_clock = LtcFrameClock::new(48_000, fps);
+        let mut samples_until_frame_boundary = 0;
+        let mut samples = vec![0.0; 1_920];
+        let utc_timezone = timezone_index("UTC").expect("UTC timezone is available");
+
+        generate_ltc_frames(
+            &mut samples,
+            &mut generator,
+            &mut frame_clock,
+            &mut samples_until_frame_boundary,
+            48_000,
+            Duration::ZERO,
+            0,
+            utc_timezone,
+            fps,
+        );
+
+        assert_eq!(samples_until_frame_boundary, 0);
+        assert!(
+            samples
+                .iter()
+                .all(|sample| *sample == -1.0 || *sample == 1.0)
+        );
+    }
+}

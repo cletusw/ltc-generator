@@ -247,3 +247,20 @@ fn current_default_output_device_id(host: &cpal::Host) -> Result<Option<String>,
     .map_err(|_| "Audio host device polling panicked".to_owned())?
     .map_err(|error| format!("Could not identify default audio output device: {error}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_the_app_stops_audio_output() {
+        let worker_running = Arc::new(AtomicBool::new(true));
+        let audio_enabled = Arc::new(AtomicBool::new(true));
+        let app_audio_worker = AudioWorkerGuard::new(worker_running.clone(), audio_enabled.clone());
+
+        drop(app_audio_worker);
+
+        assert!(!worker_running.load(Ordering::Relaxed));
+        assert!(!audio_enabled.load(Ordering::Relaxed));
+    }
+}

@@ -127,3 +127,18 @@ pub(crate) fn store_time_at_base(
         .expect("timestamp at monotonic base is out of range");
     offset_ms.store(timestamp_at_base, Ordering::Relaxed);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adjusted_system_time_applies_ntp_offset() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+
+        assert_eq!(
+            adjusted_system_time(1.5, now),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(11_500))
+        );
+    }
+}

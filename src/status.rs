@@ -33,3 +33,21 @@ pub(crate) fn set_audio_status(status_text: &Mutex<StatusText>, message: &str) {
         status.audio = Some(message.to_owned());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn successful_sync_and_audio_enable_status_reads_as_expected() {
+        let status_text = Mutex::new(StatusText::new("NTP: Syncing"));
+
+        set_ntp_status(&status_text, "NTP Locked (pool.ntp.org)");
+        set_audio_status(&status_text, "Audio output stream is playing");
+
+        assert_eq!(
+            status_text.lock().unwrap().combined(),
+            "NTP Locked (pool.ntp.org) | Audio output: Audio output stream is playing"
+        );
+    }
+}
