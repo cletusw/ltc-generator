@@ -246,6 +246,10 @@ impl LtcApp {
                     let shared_volume_dbfs = app.shared_volume_dbfs.clone();
                     let offset_ms = app.offset_ms.clone();
                     let base_instant = app.local_base;
+                    let mut generator_fps =
+                        SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
+                    let mut ltc_gen =
+                        LtcGenerator::new(sample_rate, generator_fps.to_oximedia_fps());
 
                     let stream = device.build_output_stream(
                         stream_config,
@@ -274,6 +278,10 @@ impl LtcApp {
                             let ms = local_time.timestamp_subsec_millis();
 
                             let frame_rate_enum = fps.to_oximedia_fps();
+                            if fps != generator_fps {
+                                ltc_gen = LtcGenerator::new(sample_rate, frame_rate_enum);
+                                generator_fps = fps;
+                            }
                             let frames_per_sec = match fps {
                                 SelectedFps::Fps24 => 24.0,
                                 SelectedFps::Fps25 => 25.0,
@@ -284,7 +292,6 @@ impl LtcApp {
                             let f = ((ms as f32 / 1000.0) * frames_per_sec) as u8;
 
                             if let Ok(tc) = Timecode::new(h, m, s, f, frame_rate_enum) {
-                                let mut ltc_gen = LtcGenerator::new(sample_rate, frame_rate_enum);
                                 let _ = ltc_gen.generate(&tc, data);
                                 let gain = 10.0_f32
                                     .powf(shared_volume_dbfs.load(Ordering::Relaxed) as f32 / 20.0);
