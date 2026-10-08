@@ -149,187 +149,13 @@ impl LtcApp {
         app.shared_volume_dbfs
             .store(app.volume_dbfs, Ordering::Relaxed);
 
-        let offset_clone = app.offset_ms.clone();
-        let status_clone = app.status_text.clone();
-        let base_instant = app.local_base;
+        start_ntp_sync(
+            app.offset_ms.clone(),
+            app.status_text.clone(),
+            app.local_base,
+        );
 
-        // Background NTP Sync
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new();
-            match rt {
-                Ok(runtime) => {
-                    let result = runtime.block_on(async {
-                        let mut config = NtpClientConfig::default();
-                        config.timeout = Duration::from_secs(3);
-                        config.max_retries = 1;
-                        let mut ntp = NtpClient::with_config(config);
-                        let mut dns_errors = Vec::new();
-                        let mut resolved_server_count = 0;
-
-                        for server in [
-                            "time.google.com:123",
-                            "time.cloudflare.com:123",
-                            "pool.ntp.org:123",
-                        ] {
-                            match tokio::net::lookup_host(server).await {
-                                Ok(addresses) => {
-                                    let addresses: Vec<_> = addresses.collect();
-                                    if addresses.is_empty() {
-                                        dns_errors.push(format!("{server}: no addresses returned"));
-                                    }
-                                    for address in addresses {
-                                        ntp.add_server(address);
-                                        resolved_server_count += 1;
-                                    }
-                                }
-                                Err(error) => {
-                                    dns_errors.push(format!("{server}: {error}"));
-                                }
-                            }
-                        }
-
-                        if resolved_server_count == 0 {
-                            return Err(format!(
-                                "Could not resolve any NTP servers ({})",
-                                dns_errors.join("; ")
-                            ));
-                        }
-
-                        ntp.synchronize().await.map_err(|error| {
-                            if dns_errors.is_empty() {
-                                error.to_string()
-                            } else {
-                                format!("{error}; DNS lookup failures: {}", dns_errors.join("; "))
-                            }
-                        })
-                    });
-
-                    match result {
-                        Ok(sync) => {
-                            let ntp_sys = if sync.offset.is_finite() {
-                                let now = SystemTime::now();
-                                let adjustment = Duration::from_secs_f64(sync.offset.abs());
-                                if sync.offset < 0.0 {
-                                    now.checked_sub(adjustment)
-                                } else {
-                                    now.checked_add(adjustment)
-                                }
-                            } else {
-                                None
-                            };
-
-                            if let Some(time) = ntp_sys.map(DateTime::<Utc>::from) {
-                                store_time_at_base(&offset_clone, time, base_instant);
-                                set_ntp_status(&status_clone, "NTP Locked (pool.ntp.org)");
-                            } else {
-                                use_system_time_fallback(
-                                    &offset_clone,
-                                    &status_clone,
-                                    base_instant,
-                                    "invalid NTP time adjustment",
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            use_system_time_fallback(
-                                &offset_clone,
-                                &status_clone,
-                                base_instant,
-                                &e,
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    use_system_time_fallback(&offset_clone, &status_clone, base_instant, &e);
-                }
-            }
-        });
-
-        // Audio Stream Initialization
-        let audio_result = std::panic::catch_unwind(cpal::default_host)
-            .map_err(|_| "Audio host initialization panicked".to_owned())
-            .and_then(|host| {
-                host.default_output_device()
-                    .ok_or_else(|| "No default audio output device is available".to_owned())
-            })
-            .and_then(|device| {
-                let config = device
-                    .default_output_config()
-                    .map_err(|error| format!("Could not read audio output config: {error}"))?;
-                let sample_rate = config.sample_rate();
-                let stream_config = config.into();
-                let shared_fps = app.shared_fps.clone();
-                let shared_timezone = app.shared_timezone.clone();
-                let shared_enabled_flag = app.shared_enabled.clone();
-                let shared_volume_dbfs = app.shared_volume_dbfs.clone();
-                let offset_ms = app.offset_ms.clone();
-                let base_instant = app.local_base;
-                let mut generator_fps =
-                    SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
-                let mut ltc_gen = LtcGenerator::new(sample_rate, generator_fps.to_oximedia_fps());
-
-                device
-                    .build_output_stream(
-                        stream_config,
-                        move |data: &mut [f32], _| {
-                            if !shared_enabled_flag.load(Ordering::Relaxed) {
-                                for sample in data.iter_mut() {
-                                    *sample = 0.0;
-                                }
-                                return;
-                            }
-
-                            let fps = SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
-                            let timezone_index =
-                                shared_timezone.load(Ordering::Relaxed) % TZ_VARIANTS.len();
-                            let Some(local_time) = current_utc_time(
-                                offset_ms.load(Ordering::Relaxed),
-                                base_instant.elapsed(),
-                            )
-                            .map(|time| time.with_timezone(&TZ_VARIANTS[timezone_index])) else {
-                                data.fill(0.0);
-                                return;
-                            };
-                            let h = local_time.hour() as u8;
-                            let m = local_time.minute() as u8;
-                            let s = local_time.second() as u8;
-                            let ms = local_time.timestamp_subsec_millis();
-
-                            let frame_rate_enum = fps.to_oximedia_fps();
-                            if fps != generator_fps {
-                                ltc_gen = LtcGenerator::new(sample_rate, frame_rate_enum);
-                                generator_fps = fps;
-                            }
-                            let frames_per_sec = match fps {
-                                SelectedFps::Fps24 => 24.0,
-                                SelectedFps::Fps25 => 25.0,
-                                SelectedFps::Fps2997Ndf | SelectedFps::Fps2997Df => 29.97,
-                                SelectedFps::Fps30 => 30.0,
-                            };
-
-                            let f = ((ms as f32 / 1000.0) * frames_per_sec) as u8;
-
-                            if let Ok(tc) = Timecode::new(h, m, s, f, frame_rate_enum) {
-                                let _ = ltc_gen.generate(&tc, data);
-                                let gain = 10.0_f32
-                                    .powf(shared_volume_dbfs.load(Ordering::Relaxed) as f32 / 20.0);
-                                for sample in data.iter_mut() {
-                                    *sample *= gain;
-                                }
-                            }
-                        },
-                        |_| {},
-                        None,
-                    )
-                    .map_err(|error| format!("Could not build audio output stream: {error}"))
-            })
-            .and_then(|stream| {
-                stream
-                    .play()
-                    .map(|()| stream)
-                    .map_err(|error| format!("Could not start audio output stream: {error}"))
-            });
+        let audio_result = initialize_audio_stream(&app);
 
         match audio_result {
             Ok(stream) => {
@@ -345,6 +171,186 @@ impl LtcApp {
 
         app
     }
+}
+
+fn start_ntp_sync(
+    offset_ms: Arc<AtomicI64>,
+    status_text: Arc<Mutex<String>>,
+    base_instant: Instant,
+) {
+    // Background NTP Sync
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new();
+        match rt {
+            Ok(runtime) => {
+                let result = runtime.block_on(async {
+                    let mut config = NtpClientConfig::default();
+                    config.timeout = Duration::from_secs(3);
+                    config.max_retries = 1;
+                    let mut ntp = NtpClient::with_config(config);
+                    let mut dns_errors = Vec::new();
+                    let mut resolved_server_count = 0;
+
+                    for server in [
+                        "time.google.com:123",
+                        "time.cloudflare.com:123",
+                        "pool.ntp.org:123",
+                    ] {
+                        match tokio::net::lookup_host(server).await {
+                            Ok(addresses) => {
+                                let addresses: Vec<_> = addresses.collect();
+                                if addresses.is_empty() {
+                                    dns_errors.push(format!("{server}: no addresses returned"));
+                                }
+                                for address in addresses {
+                                    ntp.add_server(address);
+                                    resolved_server_count += 1;
+                                }
+                            }
+                            Err(error) => {
+                                dns_errors.push(format!("{server}: {error}"));
+                            }
+                        }
+                    }
+
+                    if resolved_server_count == 0 {
+                        return Err(format!(
+                            "Could not resolve any NTP servers ({})",
+                            dns_errors.join("; ")
+                        ));
+                    }
+
+                    ntp.synchronize().await.map_err(|error| {
+                        if dns_errors.is_empty() {
+                            error.to_string()
+                        } else {
+                            format!("{error}; DNS lookup failures: {}", dns_errors.join("; "))
+                        }
+                    })
+                });
+
+                match result {
+                    Ok(sync) => {
+                        let ntp_sys = if sync.offset.is_finite() {
+                            let now = SystemTime::now();
+                            let adjustment = Duration::from_secs_f64(sync.offset.abs());
+                            if sync.offset < 0.0 {
+                                now.checked_sub(adjustment)
+                            } else {
+                                now.checked_add(adjustment)
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(time) = ntp_sys.map(DateTime::<Utc>::from) {
+                            store_time_at_base(&offset_ms, time, base_instant);
+                            set_ntp_status(&status_text, "NTP Locked (pool.ntp.org)");
+                        } else {
+                            use_system_time_fallback(
+                                &offset_ms,
+                                &status_text,
+                                base_instant,
+                                "invalid NTP time adjustment",
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        use_system_time_fallback(&offset_ms, &status_text, base_instant, &e);
+                    }
+                }
+            }
+            Err(e) => {
+                use_system_time_fallback(&offset_ms, &status_text, base_instant, &e);
+            }
+        }
+    });
+}
+
+fn initialize_audio_stream(app: &LtcApp) -> Result<cpal::Stream, String> {
+    // Audio Stream Initialization
+    std::panic::catch_unwind(cpal::default_host)
+        .map_err(|_| "Audio host initialization panicked".to_owned())
+        .and_then(|host| {
+            host.default_output_device()
+                .ok_or_else(|| "No default audio output device is available".to_owned())
+        })
+        .and_then(|device| {
+            let config = device
+                .default_output_config()
+                .map_err(|error| format!("Could not read audio output config: {error}"))?;
+            let sample_rate = config.sample_rate();
+            let stream_config = config.into();
+            let shared_fps = app.shared_fps.clone();
+            let shared_timezone = app.shared_timezone.clone();
+            let shared_enabled_flag = app.shared_enabled.clone();
+            let shared_volume_dbfs = app.shared_volume_dbfs.clone();
+            let offset_ms = app.offset_ms.clone();
+            let base_instant = app.local_base;
+            let mut generator_fps = SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
+            let mut ltc_gen = LtcGenerator::new(sample_rate, generator_fps.to_oximedia_fps());
+
+            device
+                .build_output_stream(
+                    stream_config,
+                    move |data: &mut [f32], _| {
+                        if !shared_enabled_flag.load(Ordering::Relaxed) {
+                            for sample in data.iter_mut() {
+                                *sample = 0.0;
+                            }
+                            return;
+                        }
+
+                        let fps = SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
+                        let timezone_index =
+                            shared_timezone.load(Ordering::Relaxed) % TZ_VARIANTS.len();
+                        let Some(local_time) = current_utc_time(
+                            offset_ms.load(Ordering::Relaxed),
+                            base_instant.elapsed(),
+                        )
+                        .map(|time| time.with_timezone(&TZ_VARIANTS[timezone_index])) else {
+                            data.fill(0.0);
+                            return;
+                        };
+                        let h = local_time.hour() as u8;
+                        let m = local_time.minute() as u8;
+                        let s = local_time.second() as u8;
+                        let ms = local_time.timestamp_subsec_millis();
+
+                        let frame_rate_enum = fps.to_oximedia_fps();
+                        if fps != generator_fps {
+                            ltc_gen = LtcGenerator::new(sample_rate, frame_rate_enum);
+                            generator_fps = fps;
+                        }
+                        let frames_per_sec = match fps {
+                            SelectedFps::Fps24 => 24.0,
+                            SelectedFps::Fps25 => 25.0,
+                            SelectedFps::Fps2997Ndf | SelectedFps::Fps2997Df => 29.97,
+                            SelectedFps::Fps30 => 30.0,
+                        };
+
+                        let f = ((ms as f32 / 1000.0) * frames_per_sec) as u8;
+
+                        if let Ok(tc) = Timecode::new(h, m, s, f, frame_rate_enum) {
+                            let _ = ltc_gen.generate(&tc, data);
+                            let gain = 10.0_f32
+                                .powf(shared_volume_dbfs.load(Ordering::Relaxed) as f32 / 20.0);
+                            for sample in data.iter_mut() {
+                                *sample *= gain;
+                            }
+                        }
+                    },
+                    |_| {},
+                    None,
+                )
+                .map_err(|error| format!("Could not build audio output stream: {error}"))
+        })
+        .and_then(|stream| {
+            stream
+                .play()
+                .map(|()| stream)
+                .map_err(|error| format!("Could not start audio output stream: {error}"))
+        })
 }
 
 fn use_system_time_fallback(
