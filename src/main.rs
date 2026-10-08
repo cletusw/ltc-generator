@@ -7,7 +7,7 @@ use oximedia_timesync::NtpClient;
 use oximedia_timesync::ntp::client::NtpClientConfig;
 use oximedia_timesync::timecode::ltc::LtcGenerator;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -73,6 +73,7 @@ pub struct LtcApp {
     #[serde(skip)]
     timezone_scroll_to_selection: bool,
     audio_enabled: bool,
+    volume_dbfs: i32,
 
     #[serde(skip)]
     shared_fps: Arc<AtomicU8>,
@@ -80,6 +81,8 @@ pub struct LtcApp {
     shared_timezone: Arc<AtomicUsize>,
     #[serde(skip)]
     shared_enabled: Arc<AtomicBool>,
+    #[serde(skip)]
+    shared_volume_dbfs: Arc<AtomicI32>,
     #[serde(skip)]
     offset_ms: Arc<AtomicI64>,
     #[serde(skip)]
@@ -100,11 +103,13 @@ impl Default for LtcApp {
             timezone_search_needs_focus: false,
             timezone_scroll_to_selection: false,
             audio_enabled: true,
+            volume_dbfs: -18,
             shared_fps: Arc::new(AtomicU8::new(SelectedFps::Fps2997Df as u8)),
             shared_timezone: Arc::new(AtomicUsize::new(
                 timezone_index(&system_timezone_name()).unwrap_or(0),
             )),
             shared_enabled: Arc::new(AtomicBool::new(true)),
+            shared_volume_dbfs: Arc::new(AtomicI32::new(-18)),
             offset_ms: Arc::new(AtomicI64::new(0)),
             local_base: Instant::now(),
             status_text: Arc::new(Mutex::new("Syncing via OxiMedia NTP...".into())),
@@ -133,6 +138,9 @@ impl LtcApp {
         );
         app.shared_enabled
             .store(app.audio_enabled, Ordering::Relaxed);
+        app.volume_dbfs = app.volume_dbfs.clamp(-60, 0);
+        app.shared_volume_dbfs
+            .store(app.volume_dbfs, Ordering::Relaxed);
 
         let offset_clone = app.offset_ms.clone();
         let status_clone = app.status_text.clone();
@@ -235,6 +243,7 @@ impl LtcApp {
                     let shared_fps = app.shared_fps.clone();
                     let shared_timezone = app.shared_timezone.clone();
                     let shared_enabled_flag = app.shared_enabled.clone();
+                    let shared_volume_dbfs = app.shared_volume_dbfs.clone();
                     let offset_ms = app.offset_ms.clone();
                     let base_instant = app.local_base;
 
@@ -277,6 +286,11 @@ impl LtcApp {
                             if let Ok(tc) = Timecode::new(h, m, s, f, frame_rate_enum) {
                                 let mut ltc_gen = LtcGenerator::new(sample_rate, frame_rate_enum);
                                 let _ = ltc_gen.generate(&tc, data);
+                                let gain = 10.0_f32
+                                    .powf(shared_volume_dbfs.load(Ordering::Relaxed) as f32 / 20.0);
+                                for sample in data.iter_mut() {
+                                    *sample *= gain;
+                                }
                             }
                         },
                         |_| {},
@@ -470,6 +484,16 @@ impl eframe::App for LtcApp {
                 self.shared_enabled
                     .store(self.audio_enabled, Ordering::Relaxed);
             }
+
+            ui.horizontal(|ui| {
+                ui.label("LTC Output Level:");
+                let previous_volume = self.volume_dbfs;
+                ui.add(egui::Slider::new(&mut self.volume_dbfs, -60..=0).suffix(" dBFS"));
+                if previous_volume != self.volume_dbfs {
+                    self.shared_volume_dbfs
+                        .store(self.volume_dbfs, Ordering::Relaxed);
+                }
+            });
 
             ui.add_space(12.0);
 
