@@ -1,3 +1,5 @@
+use chrono::{DateTime, Timelike, Utc};
+use chrono_tz::TZ_VARIANTS;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use oximedia_timecode::{FrameRate as OxiFrameRate, Timecode};
@@ -5,7 +7,7 @@ use oximedia_timesync::NtpClient;
 use oximedia_timesync::ntp::client::NtpClientConfig;
 use oximedia_timesync::timecode::ltc::LtcGenerator;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -61,10 +63,13 @@ impl Default for SelectedFps {
 #[serde(default)]
 pub struct LtcApp {
     selected_fps: SelectedFps,
+    selected_timezone: String,
     audio_enabled: bool,
 
     #[serde(skip)]
     shared_fps: Arc<AtomicU8>,
+    #[serde(skip)]
+    shared_timezone: Arc<AtomicUsize>,
     #[serde(skip)]
     shared_enabled: Arc<AtomicBool>,
     #[serde(skip)]
@@ -81,8 +86,12 @@ impl Default for LtcApp {
     fn default() -> Self {
         Self {
             selected_fps: SelectedFps::Fps2997Df,
+            selected_timezone: system_timezone_name(),
             audio_enabled: true,
             shared_fps: Arc::new(AtomicU8::new(SelectedFps::Fps2997Df as u8)),
+            shared_timezone: Arc::new(AtomicUsize::new(
+                timezone_index(&system_timezone_name()).unwrap_or(0),
+            )),
             shared_enabled: Arc::new(AtomicBool::new(true)),
             offset_ms: Arc::new(AtomicI64::new(0)),
             local_base: Instant::now(),
@@ -103,6 +112,13 @@ impl LtcApp {
         app.local_base = Instant::now();
         app.shared_fps
             .store(app.selected_fps as u8, Ordering::Relaxed);
+        if timezone_index(&app.selected_timezone).is_none() {
+            app.selected_timezone = system_timezone_name();
+        }
+        app.shared_timezone.store(
+            timezone_index(&app.selected_timezone).unwrap_or(0),
+            Ordering::Relaxed,
+        );
         app.shared_enabled
             .store(app.audio_enabled, Ordering::Relaxed);
 
@@ -206,6 +222,7 @@ impl LtcApp {
                 if let Ok(config) = device.default_output_config() {
                     let sample_rate = config.sample_rate().0;
                     let shared_fps = app.shared_fps.clone();
+                    let shared_timezone = app.shared_timezone.clone();
                     let shared_enabled_flag = app.shared_enabled.clone();
                     let offset_ms = app.offset_ms.clone();
                     let base_instant = app.local_base;
@@ -224,13 +241,14 @@ impl LtcApp {
                             let base_offset = offset_ms.load(Ordering::Relaxed);
                             let current_time =
                                 Duration::from_millis(base_offset as u64) + base_instant.elapsed();
-
-                            let total_secs = current_time.as_secs();
-                            let ms = current_time.subsec_millis();
-
-                            let h = ((total_secs / 3600) % 24) as u8;
-                            let m = ((total_secs / 60) % 60) as u8;
-                            let s = (total_secs % 60) as u8;
+                            let timezone_index =
+                                shared_timezone.load(Ordering::Relaxed) % TZ_VARIANTS.len();
+                            let local_time = DateTime::<Utc>::from(UNIX_EPOCH + current_time)
+                                .with_timezone(&TZ_VARIANTS[timezone_index]);
+                            let h = local_time.hour() as u8;
+                            let m = local_time.minute() as u8;
+                            let s = local_time.second() as u8;
+                            let ms = local_time.timestamp_subsec_millis();
 
                             let frame_rate_enum = fps.to_oximedia_fps();
                             let frames_per_sec = match fps {
@@ -321,6 +339,28 @@ impl eframe::App for LtcApp {
                         }
                     });
 
+                ui.horizontal(|ui| {
+                    ui.label("Timezone:");
+                    let previous_timezone = self.selected_timezone.clone();
+                    egui::ComboBox::from_id_source("timezone_selector")
+                        .selected_text(&self.selected_timezone)
+                        .show_ui(ui, |ui| {
+                            for timezone in TZ_VARIANTS {
+                                let timezone_name = timezone.to_string();
+                                ui.selectable_value(
+                                    &mut self.selected_timezone,
+                                    timezone_name.clone(),
+                                    timezone_name,
+                                );
+                            }
+                        });
+                    if previous_timezone != self.selected_timezone {
+                        if let Some(index) = timezone_index(&self.selected_timezone) {
+                            self.shared_timezone.store(index, Ordering::Relaxed);
+                        }
+                    }
+                });
+
                 if prev != self.selected_fps {
                     self.shared_fps
                         .store(self.selected_fps as u8, Ordering::Relaxed);
@@ -339,25 +379,38 @@ impl eframe::App for LtcApp {
 
             let current_wall = Duration::from_millis(self.offset_ms.load(Ordering::Relaxed) as u64)
                 + self.local_base.elapsed();
-
-            let total_secs = current_wall.as_secs();
-            let h = (total_secs / 3600 % 24) as u32;
-            let m = (total_secs / 60 % 60) as u32;
-            let s = (total_secs % 60) as u32;
+            let timezone_index = self.shared_timezone.load(Ordering::Relaxed) % TZ_VARIANTS.len();
+            let local_time = DateTime::<Utc>::from(UNIX_EPOCH + current_wall)
+                .with_timezone(&TZ_VARIANTS[timezone_index]);
 
             // Simplified display: HH:MM:SS
             ui.group(|ui| {
                 ui.centered_and_justified(|ui| {
                     ui.label(
-                        egui::RichText::new(format!("{:02}:{:02}:{:02}", h, m, s))
-                            .size(42.0)
-                            .monospace()
-                            .strong(),
+                        egui::RichText::new(format!(
+                            "{:02}:{:02}:{:02}",
+                            local_time.hour(),
+                            local_time.minute(),
+                            local_time.second()
+                        ))
+                        .size(42.0)
+                        .monospace()
+                        .strong(),
                     );
                 });
             });
         });
     }
+}
+
+fn system_timezone_name() -> String {
+    iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_owned())
+}
+
+fn timezone_index(name: &str) -> Option<usize> {
+    TZ_VARIANTS
+        .iter()
+        .position(|timezone| timezone.to_string() == name)
 }
 
 fn main() -> eframe::Result<()> {
