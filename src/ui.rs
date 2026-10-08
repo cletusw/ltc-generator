@@ -12,6 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const APP_NAME: &str = "LTC Generator w/ NTP";
+// eframe writes these native persistence keys before calling App::save on shutdown.
+const EGUI_MEMORY_STORAGE_KEY: &str = "egui";
+const WINDOW_STORAGE_KEY: &str = "window";
 
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -28,6 +31,10 @@ pub struct LtcApp {
     timezone_scroll_to_selection: bool,
     #[serde(skip)]
     audio_enabled: bool,
+    #[serde(skip)]
+    clear_storage_confirmation_open: bool,
+    #[serde(skip)]
+    clear_storage_on_save: bool,
     volume_dbfs: i32,
 
     #[serde(skip)]
@@ -70,6 +77,8 @@ impl Default for LtcApp {
             timezone_search_needs_focus: false,
             timezone_scroll_to_selection: false,
             audio_enabled: false,
+            clear_storage_confirmation_open: false,
+            clear_storage_on_save: false,
             volume_dbfs: -6,
             shared_fps: Arc::new(AtomicU8::new(SelectedFps::Fps2997Df as u8)),
             shared_timezone: Arc::new(AtomicUsize::new(
@@ -144,7 +153,13 @@ impl LtcApp {
 
 impl eframe::App for LtcApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, eframe::APP_KEY, self);
+        if self.clear_storage_on_save {
+            storage.remove_string(eframe::APP_KEY);
+            storage.remove_string(EGUI_MEMORY_STORAGE_KEY);
+            storage.remove_string(WINDOW_STORAGE_KEY);
+        } else {
+            eframe::set_value(storage, eframe::APP_KEY, self);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -159,7 +174,14 @@ impl eframe::App for LtcApp {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading(APP_NAME);
+            ui.horizontal(|ui| {
+                ui.heading(APP_NAME);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Clear saved app data...").clicked() {
+                        self.clear_storage_confirmation_open = true;
+                    }
+                });
+            });
 
             // Standard Mutex safe-lock for UI
             if let Ok(status) = self.status_text.lock() {
@@ -365,6 +387,32 @@ impl eframe::App for LtcApp {
                 });
             });
         });
+
+        if self.clear_storage_confirmation_open {
+            let mut confirm_clear = false;
+            let mut cancel_clear = false;
+            egui::Modal::new(egui::Id::new("clear_storage_confirmation")).show(&ctx, |ui| {
+                ui.heading("Clear saved app data?");
+                ui.label(
+                    "This resets saved settings, UI state, and window size. The app will close; reopen it to use the defaults.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Clear data and close").clicked() {
+                        confirm_clear = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel_clear = true;
+                    }
+                });
+            });
+            if confirm_clear {
+                self.clear_storage_confirmation_open = false;
+                self.clear_storage_on_save = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if cancel_clear {
+                self.clear_storage_confirmation_open = false;
+            }
+        }
     }
 }
 
@@ -431,6 +479,26 @@ mod tests {
         Harness,
         kittest::{NodeT, Queryable},
     };
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct MemoryStorage(HashMap<String, String>);
+
+    impl eframe::Storage for MemoryStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+
+        fn remove_string(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+
+        fn flush(&mut self) {}
+    }
 
     #[test]
     fn enabling_audio_output_updates_the_app_and_status() {
@@ -455,5 +523,23 @@ mod tests {
             status_text.lock().unwrap().combined(),
             "NTP: Locked | Audio output: Audio output stream is playing"
         );
+    }
+
+    #[test]
+    fn clearing_saved_app_data_removes_app_and_eframe_state() {
+        let mut app = LtcApp {
+            clear_storage_on_save: true,
+            ..LtcApp::default()
+        };
+        let mut storage = MemoryStorage(
+            [eframe::APP_KEY, EGUI_MEMORY_STORAGE_KEY, WINDOW_STORAGE_KEY]
+                .into_iter()
+                .map(|key| (key.to_owned(), "saved".to_owned()))
+                .collect(),
+        );
+
+        <LtcApp as eframe::App>::save(&mut app, &mut storage);
+
+        assert!(storage.0.is_empty());
     }
 }
