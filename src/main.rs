@@ -98,7 +98,7 @@ pub struct LtcApp {
     #[serde(skip)]
     local_base: Instant,
     #[serde(skip)]
-    status_text: Arc<Mutex<String>>,
+    status_text: Arc<Mutex<StatusText>>,
     #[serde(skip)]
     audio_available: Arc<AtomicBool>,
     #[serde(skip)]
@@ -134,7 +134,10 @@ impl Default for LtcApp {
             shared_volume_dbfs: Arc::new(AtomicI32::new(-6)),
             offset_ms,
             local_base,
-            status_text: Arc::new(Mutex::new("NTP: Syncing via OxiMedia NTP...".into())),
+            status_text: Arc::new(Mutex::new(StatusText {
+                ntp: "NTP: Syncing via OxiMedia NTP...".into(),
+                audio: None,
+            })),
             audio_available: Arc::new(AtomicBool::new(false)),
             audio_stream_error: Arc::new(AtomicBool::new(false)),
             audio_worker_running: audio_worker_running.clone(),
@@ -217,7 +220,7 @@ struct SharedAudioState {
     volume_dbfs: Arc<AtomicI32>,
     offset_ms: Arc<AtomicI64>,
     local_base: Instant,
-    status_text: Arc<Mutex<String>>,
+    status_text: Arc<Mutex<StatusText>>,
     stream_error: Arc<AtomicBool>,
     available: Arc<AtomicBool>,
     worker_running: Arc<AtomicBool>,
@@ -225,7 +228,7 @@ struct SharedAudioState {
 
 fn start_ntp_sync(
     offset_ms: Arc<AtomicI64>,
-    status_text: Arc<Mutex<String>>,
+    status_text: Arc<Mutex<StatusText>>,
     base_instant: Instant,
 ) {
     // Background NTP Sync
@@ -656,7 +659,7 @@ impl LtcFrameClock {
 
 fn use_system_time_fallback(
     offset_ms: &AtomicI64,
-    status_text: &Mutex<String>,
+    status_text: &Mutex<StatusText>,
     base_instant: Instant,
     error: impl std::fmt::Display,
 ) {
@@ -666,30 +669,29 @@ fn use_system_time_fallback(
     set_ntp_status(status_text, &status);
 }
 
-fn set_ntp_status(status_text: &Mutex<String>, message: &str) {
-    const AUDIO_STATUS_SEPARATOR: &str = " | Audio output: ";
+struct StatusText {
+    ntp: String,
+    audio: Option<String>,
+}
 
-    if let Ok(mut status) = status_text.lock() {
-        let audio_status = status
-            .split_once(AUDIO_STATUS_SEPARATOR)
-            .map(|(_, audio_status)| audio_status);
-        *status = match audio_status {
-            Some(audio_status) => format!("{message}{AUDIO_STATUS_SEPARATOR}{audio_status}"),
-            None => message.to_owned(),
-        };
+impl StatusText {
+    fn combined(&self) -> String {
+        match &self.audio {
+            Some(audio) => format!("{} | Audio output: {audio}", self.ntp),
+            None => self.ntp.clone(),
+        }
     }
 }
 
-fn set_audio_status(status_text: &Mutex<String>, message: &str) {
-    const AUDIO_STATUS_SEPARATOR: &str = " | Audio output: ";
-
+fn set_ntp_status(status_text: &Mutex<StatusText>, message: &str) {
     if let Ok(mut status) = status_text.lock() {
-        let ntp_status = status
-            .split_once(AUDIO_STATUS_SEPARATOR)
-            .map(|(ntp_status, _)| ntp_status)
-            .unwrap_or(status.as_str())
-            .to_owned();
-        *status = format!("{ntp_status}{AUDIO_STATUS_SEPARATOR}{message}");
+        status.ntp = message.to_owned();
+    }
+}
+
+fn set_audio_status(status_text: &Mutex<StatusText>, message: &str) {
+    if let Ok(mut status) = status_text.lock() {
+        status.audio = Some(message.to_owned());
     }
 }
 
@@ -723,7 +725,7 @@ impl eframe::App for LtcApp {
 
             // Standard Mutex safe-lock for UI
             if let Ok(status) = self.status_text.lock() {
-                ui.label(egui::RichText::new(status.as_str()).small());
+                ui.label(egui::RichText::new(status.combined()).small());
             }
 
             ui.separator();
