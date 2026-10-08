@@ -81,6 +81,7 @@ pub struct LtcApp {
     timezone_search_needs_focus: bool,
     #[serde(skip)]
     timezone_scroll_to_selection: bool,
+    #[serde(skip)]
     audio_enabled: bool,
     volume_dbfs: i32,
 
@@ -115,14 +116,14 @@ impl Default for LtcApp {
             timezone_picker_open: false,
             timezone_search_needs_focus: false,
             timezone_scroll_to_selection: false,
-            audio_enabled: true,
-            volume_dbfs: -18,
+            audio_enabled: false,
+            volume_dbfs: -6,
             shared_fps: Arc::new(AtomicU8::new(SelectedFps::Fps2997Df as u8)),
             shared_timezone: Arc::new(AtomicUsize::new(
                 timezone_index(&system_timezone_name()).unwrap_or(0),
             )),
-            shared_enabled: Arc::new(AtomicBool::new(true)),
-            shared_volume_dbfs: Arc::new(AtomicI32::new(-18)),
+            shared_enabled: Arc::new(AtomicBool::new(false)),
+            shared_volume_dbfs: Arc::new(AtomicI32::new(-6)),
             offset_ms,
             local_base,
             status_text: Arc::new(Mutex::new("NTP: Syncing via OxiMedia NTP...".into())),
@@ -150,8 +151,8 @@ impl LtcApp {
             timezone_index(&app.selected_timezone).unwrap_or(0),
             Ordering::Relaxed,
         );
-        app.shared_enabled
-            .store(app.audio_enabled, Ordering::Relaxed);
+        app.audio_enabled = false;
+        app.shared_enabled.store(false, Ordering::Relaxed);
         app.volume_dbfs = app.volume_dbfs.clamp(-60, 0);
         app.shared_volume_dbfs
             .store(app.volume_dbfs, Ordering::Relaxed);
@@ -719,14 +720,6 @@ impl eframe::App for LtcApp {
                 self.shared_timezone.store(index, Ordering::Relaxed);
             }
 
-            if ui
-                .checkbox(&mut self.audio_enabled, "Output LTC to Audio Jack")
-                .changed()
-            {
-                self.shared_enabled
-                    .store(self.audio_enabled, Ordering::Relaxed);
-            }
-
             ui.horizontal(|ui| {
                 ui.label("LTC Output Level:");
                 let previous_volume = self.volume_dbfs;
@@ -738,6 +731,24 @@ impl eframe::App for LtcApp {
             });
 
             ui.add_space(12.0);
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(ui.available_width() * 0.1);
+                    if ui
+                        .checkbox(
+                            &mut self.audio_enabled,
+                            egui::RichText::new("Enable LTC Audio Output")
+                                .size(18.0)
+                                .strong(),
+                        )
+                        .changed()
+                    {
+                        self.shared_enabled
+                            .store(self.audio_enabled, Ordering::Relaxed);
+                    }
+                });
+            });
 
             let timezone_index = self.shared_timezone.load(Ordering::Relaxed) % TZ_VARIANTS.len();
             let clock_text = current_utc_time(
@@ -758,12 +769,24 @@ impl eframe::App for LtcApp {
 
             // Display tenths of a second; the repaint interval is 100 ms.
             ui.group(|ui| {
-                ui.centered_and_justified(|ui| {
+                ui.vertical_centered(|ui| {
+                    let (audio_status, clock_color) = if self.audio_enabled {
+                        ("AUDIO ENABLED", egui::Color32::RED)
+                    } else {
+                        ("AUDIO DISABLED", ui.visuals().weak_text_color())
+                    };
+                    ui.label(
+                        egui::RichText::new(audio_status)
+                            .small()
+                            .strong()
+                            .color(clock_color),
+                    );
                     ui.label(
                         egui::RichText::new(clock_text)
                             .size(42.0)
                             .monospace()
-                            .strong(),
+                            .strong()
+                            .color(clock_color),
                     );
                 });
             });
