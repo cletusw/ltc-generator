@@ -1,6 +1,6 @@
 use crate::audio::{AudioWorkerGuard, SharedAudioState, start_audio_worker};
 use crate::ltc::{SelectedFps, current_utc_time, system_timezone_name, timezone_index};
-use crate::ntp::{self, store_time_at_base};
+use crate::ntp::{self, NtpSyncWorkerGuard, store_time_at_base};
 use crate::status::{StatusText, set_audio_status};
 use chrono::Timelike;
 use chrono::Utc;
@@ -59,6 +59,8 @@ pub struct LtcApp {
     audio_worker_running: Arc<AtomicBool>,
     #[serde(skip)]
     audio_worker_guard: AudioWorkerGuard,
+    #[serde(skip)]
+    ntp_sync_worker: Option<NtpSyncWorkerGuard>,
 }
 
 impl Default for LtcApp {
@@ -95,6 +97,7 @@ impl Default for LtcApp {
             audio_stream_error: Arc::new(AtomicBool::new(false)),
             audio_worker_running: audio_worker_running.clone(),
             audio_worker_guard: AudioWorkerGuard::new(audio_worker_running, shared_enabled),
+            ntp_sync_worker: None,
         }
     }
 }
@@ -124,11 +127,11 @@ impl LtcApp {
         app.shared_volume_dbfs
             .store(app.volume_dbfs, Ordering::Relaxed);
 
-        ntp::start_ntp_sync(
+        app.ntp_sync_worker = Some(ntp::start_ntp_sync(
             app.offset_ms.clone(),
             app.status_text.clone(),
             app.local_base,
-        );
+        ));
 
         start_audio_worker(app.audio_shared_state());
 
@@ -184,9 +187,16 @@ impl eframe::App for LtcApp {
             });
 
             // Standard Mutex safe-lock for UI
-            if let Ok(status) = self.status_text.lock() {
-                ui.label(egui::RichText::new(status.combined()).small());
-            }
+            ui.horizontal(|ui| {
+                if let Ok(status) = self.status_text.lock() {
+                    ui.label(egui::RichText::new(status.combined()).small());
+                }
+                retry_now_button(ui, || {
+                    if let Some(worker) = &self.ntp_sync_worker {
+                        worker.retry_now();
+                    }
+                });
+            });
 
             ui.separator();
             ui.add_space(8.0);
@@ -459,6 +469,12 @@ fn audio_output_control(
     });
 }
 
+fn retry_now_button(ui: &mut egui::Ui, on_retry: impl FnOnce()) {
+    if ui.button("Retry now").clicked() {
+        on_retry();
+    }
+}
+
 pub(crate) fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([500.0, 300.0]),
@@ -523,6 +539,19 @@ mod tests {
             status_text.lock().unwrap().combined(),
             "NTP: Locked | Audio output: Audio output stream is playing"
         );
+    }
+
+    #[test]
+    fn retry_now_button_invokes_immediate_sync_request() {
+        let retry_requested = AtomicBool::new(false);
+        let mut harness = Harness::new_ui(|ui| {
+            retry_now_button(ui, || retry_requested.store(true, Ordering::Relaxed));
+        });
+
+        harness.get_by_label("Retry now").click();
+        harness.run();
+
+        assert!(retry_requested.load(Ordering::Relaxed));
     }
 
     #[test]
