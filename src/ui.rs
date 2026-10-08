@@ -145,8 +145,9 @@ impl eframe::App for LtcApp {
         eframe::set_value(storage, eframe::APP_KEY, self);
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // UI refresh rate lowered since we only display seconds now
+        let ctx = ui.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(100));
         self.audio_enabled = self.shared_enabled.load(Ordering::Relaxed);
         let audio_available = self.audio_available.load(Ordering::Relaxed);
@@ -155,7 +156,7 @@ impl eframe::App for LtcApp {
             self.shared_enabled.store(false, Ordering::Relaxed);
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("OxiMedia NTP LTC Generator");
 
             // Standard Mutex safe-lock for UI
@@ -169,7 +170,7 @@ impl eframe::App for LtcApp {
             ui.horizontal(|ui| {
                 ui.label("Frame Rate:");
                 let prev = self.selected_fps;
-                egui::ComboBox::from_id_source("fps_selector")
+                egui::ComboBox::from_id_salt("fps_selector")
                     .selected_text(self.selected_fps.label())
                     .show_ui(ui, |ui| {
                         for fps in [
@@ -237,12 +238,12 @@ impl eframe::App for LtcApp {
                     let popup = egui::Area::new(egui::Id::new("timezone_picker_popup"))
                         .order(egui::Order::Foreground)
                         .fixed_pos(position + egui::vec2(0.0, 4.0))
-                        .show(ctx, |ui| {
+                        .show(&ctx, |ui| {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                 ui.set_min_width(260.0);
                                 let mut selected = None;
                                 egui::ScrollArea::vertical()
-                                    .id_source("timezone_results")
+                                    .id_salt("timezone_results")
                                     .min_scrolled_height(240.0)
                                     .max_height(240.0)
                                     .auto_shrink([false, false])
