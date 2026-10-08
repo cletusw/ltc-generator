@@ -289,6 +289,8 @@ fn initialize_audio_stream(app: &LtcApp) -> Result<cpal::Stream, String> {
             let base_instant = app.local_base;
             let mut generator_fps = SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
             let mut ltc_gen = LtcGenerator::new(sample_rate, generator_fps.to_oximedia_fps());
+            let mut latched_timecode = None;
+            let mut samples_until_frame_boundary = 0;
 
             device
                 .build_output_stream(
@@ -302,42 +304,57 @@ fn initialize_audio_stream(app: &LtcApp) -> Result<cpal::Stream, String> {
                         }
 
                         let fps = SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
-                        let timezone_index =
-                            shared_timezone.load(Ordering::Relaxed) % TZ_VARIANTS.len();
-                        let Some(local_time) = current_utc_time(
-                            offset_ms.load(Ordering::Relaxed),
-                            base_instant.elapsed(),
-                        )
-                        .map(|time| time.with_timezone(&TZ_VARIANTS[timezone_index])) else {
-                            data.fill(0.0);
-                            return;
-                        };
-                        let h = local_time.hour() as u8;
-                        let m = local_time.minute() as u8;
-                        let s = local_time.second() as u8;
-                        let ms = local_time.timestamp_subsec_millis();
-
                         let frame_rate_enum = fps.to_oximedia_fps();
                         if fps != generator_fps {
                             ltc_gen = LtcGenerator::new(sample_rate, frame_rate_enum);
                             generator_fps = fps;
+                            latched_timecode = None;
+                            samples_until_frame_boundary = 0;
                         }
-                        let frames_per_sec = match fps {
-                            SelectedFps::Fps24 => 24.0,
-                            SelectedFps::Fps25 => 25.0,
-                            SelectedFps::Fps2997Ndf | SelectedFps::Fps2997Df => 29.97,
-                            SelectedFps::Fps30 => 30.0,
-                        };
 
-                        let f = ((ms as f32 / 1000.0) * frames_per_sec) as u8;
-
-                        if let Ok(tc) = Timecode::new(h, m, s, f, frame_rate_enum) {
-                            let _ = ltc_gen.generate(&tc, data);
-                            let gain = 10.0_f32
-                                .powf(shared_volume_dbfs.load(Ordering::Relaxed) as f32 / 20.0);
-                            for sample in data.iter_mut() {
-                                *sample *= gain;
+                        // LtcGenerator re-encodes on every `generate` call, so never
+                        // give it a new timecode until its current 80-bit frame ends.
+                        let offset = offset_ms.load(Ordering::Relaxed);
+                        let callback_elapsed = base_instant.elapsed();
+                        let timezone_index =
+                            shared_timezone.load(Ordering::Relaxed) % TZ_VARIANTS.len();
+                        let frame_samples = samples_per_ltc_frame(sample_rate, nominal_fps(fps));
+                        let mut sample_offset = 0;
+                        while sample_offset < data.len() {
+                            if samples_until_frame_boundary == 0 {
+                                let sample_time = callback_elapsed
+                                    + Duration::from_secs_f64(
+                                        sample_offset as f64 / f64::from(sample_rate),
+                                    );
+                                let Some(tc) =
+                                    timecode_at(offset, sample_time, timezone_index, fps)
+                                else {
+                                    data[sample_offset..].fill(0.0);
+                                    break;
+                                };
+                                latched_timecode = Some(tc);
+                                samples_until_frame_boundary = frame_samples;
                             }
+
+                            let chunk_len = samples_until_frame_boundary
+                                .min(data.len() - sample_offset);
+                            if let Some(tc) = latched_timecode.as_ref() {
+                                let _ = ltc_gen.generate(
+                                    tc,
+                                    &mut data[sample_offset..sample_offset + chunk_len],
+                                );
+                            }
+                            sample_offset += chunk_len;
+                            samples_until_frame_boundary -= chunk_len;
+                            if samples_until_frame_boundary == 0 {
+                                latched_timecode = None;
+                            }
+                        }
+
+                        let gain = 10.0_f32
+                            .powf(shared_volume_dbfs.load(Ordering::Relaxed) as f32 / 20.0);
+                        for sample in data.iter_mut() {
+                            *sample *= gain;
                         }
                     },
                     |_| {},
@@ -614,6 +631,46 @@ fn current_utc_time(offset_ms: i64, elapsed: Duration) -> Option<DateTime<Utc>> 
         .checked_add_signed(chrono::Duration::from_std(elapsed).ok()?)
 }
 
+fn timecode_at(
+    offset_ms: i64,
+    elapsed: Duration,
+    timezone_index: usize,
+    fps: SelectedFps,
+) -> Option<Timecode> {
+    let local_time = current_utc_time(offset_ms, elapsed)?
+        .with_timezone(&TZ_VARIANTS[timezone_index % TZ_VARIANTS.len()]);
+    let frames_per_sec = match fps {
+        SelectedFps::Fps24 => 24.0,
+        SelectedFps::Fps25 => 25.0,
+        SelectedFps::Fps2997Ndf | SelectedFps::Fps2997Df => 29.97,
+        SelectedFps::Fps30 => 30.0,
+    };
+    let frames =
+        ((local_time.timestamp_subsec_millis() as f32 / 1000.0) * frames_per_sec) as u8;
+    Timecode::new(
+        local_time.hour() as u8,
+        local_time.minute() as u8,
+        local_time.second() as u8,
+        frames,
+        fps.to_oximedia_fps(),
+    )
+    .ok()
+}
+
+fn nominal_fps(fps: SelectedFps) -> u32 {
+    match fps {
+        SelectedFps::Fps24 => 24,
+        SelectedFps::Fps25 => 25,
+        SelectedFps::Fps2997Ndf | SelectedFps::Fps2997Df | SelectedFps::Fps30 => 30,
+    }
+}
+
+fn samples_per_ltc_frame(sample_rate: u32, nominal_fps: u32) -> usize {
+    // LtcGenerator uses the rounded Timecode frame rate and resets its phase
+    // after the first whole sample at or beyond the nominal frame duration.
+    sample_rate.div_ceil(nominal_fps) as usize
+}
+
 fn system_timezone_name() -> String {
     iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_owned())
 }
@@ -634,4 +691,38 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(LtcApp::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{nominal_fps, samples_per_ltc_frame, SelectedFps};
+
+    #[test]
+    fn fractional_samples_per_frame_round_up_like_ltc_generator() {
+        // 44.1 kHz / 24 fps is 1837.5 samples. The generator resets phase
+        // after 1838 samples, rather than carrying the half-sample forward.
+        assert_eq!(samples_per_ltc_frame(44_100, nominal_fps(SelectedFps::Fps24)), 1838);
+        assert_eq!(samples_per_ltc_frame(48_000, nominal_fps(SelectedFps::Fps2997Df)), 1600);
+    }
+
+    #[test]
+    fn frame_chunking_splits_buffers_at_ltc_frame_boundaries() {
+        let frame_samples = samples_per_ltc_frame(44_100, nominal_fps(SelectedFps::Fps24));
+        let mut samples_until_boundary = frame_samples;
+        let mut chunks = Vec::new();
+        for buffer_samples in [1000, 2000] {
+            let mut remaining = buffer_samples;
+            while remaining > 0 {
+                let chunk = samples_until_boundary.min(remaining);
+                chunks.push(chunk);
+                remaining -= chunk;
+                samples_until_boundary -= chunk;
+                if samples_until_boundary == 0 {
+                    samples_until_boundary = frame_samples;
+                }
+            }
+        }
+
+        assert_eq!(chunks, [1000, 838, 1162]);
+    }
 }
