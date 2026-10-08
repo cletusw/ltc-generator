@@ -3,6 +3,7 @@ use std::sync::Mutex;
 #[derive(Default)]
 pub(crate) struct StatusText {
     ntp: String,
+    ntp_error: bool,
     audio: Option<String>,
 }
 
@@ -10,8 +11,13 @@ impl StatusText {
     pub(crate) fn new(ntp: impl Into<String>) -> Self {
         Self {
             ntp: ntp.into(),
+            ntp_error: false,
             audio: None,
         }
+    }
+
+    pub(crate) fn has_ntp_error(&self) -> bool {
+        self.ntp_error
     }
 
     pub(crate) fn combined(&self) -> String {
@@ -22,9 +28,10 @@ impl StatusText {
     }
 }
 
-pub(crate) fn set_ntp_status(status_text: &Mutex<StatusText>, message: &str) {
+pub(crate) fn set_ntp_status(status_text: &Mutex<StatusText>, message: &str, is_error: bool) {
     if let Ok(mut status) = status_text.lock() {
         status.ntp = message.to_owned();
+        status.ntp_error = is_error;
     }
 }
 
@@ -42,7 +49,7 @@ mod tests {
     fn successful_sync_and_audio_enable_status_reads_as_expected() {
         let status_text = Mutex::new(StatusText::new("NTP: Syncing"));
 
-        set_ntp_status(&status_text, "NTP: Locked");
+        set_ntp_status(&status_text, "NTP: Locked", false);
         set_audio_status(&status_text, "Audio output stream is playing");
 
         assert_eq!(

@@ -188,10 +188,13 @@ impl eframe::App for LtcApp {
 
             // Standard Mutex safe-lock for UI
             ui.horizontal(|ui| {
-                if let Ok(status) = self.status_text.lock() {
+                let ntp_error = if let Ok(status) = self.status_text.lock() {
                     ui.label(egui::RichText::new(status.combined()).small());
-                }
-                retry_now_button(ui, || {
+                    status.has_ntp_error()
+                } else {
+                    false
+                };
+                retry_now_button(ui, ntp_error, || {
                     if let Some(worker) = &self.ntp_sync_worker {
                         worker.retry_now();
                     }
@@ -469,8 +472,8 @@ fn audio_output_control(
     });
 }
 
-fn retry_now_button(ui: &mut egui::Ui, on_retry: impl FnOnce()) {
-    if ui.button("Retry now").clicked() {
+fn retry_now_button(ui: &mut egui::Ui, show: bool, on_retry: impl FnOnce()) {
+    if show && ui.button("Retry now").clicked() {
         on_retry();
     }
 }
@@ -545,7 +548,7 @@ mod tests {
     fn retry_now_button_invokes_immediate_sync_request() {
         let retry_requested = AtomicBool::new(false);
         let mut harness = Harness::new_ui(|ui| {
-            retry_now_button(ui, || retry_requested.store(true, Ordering::Relaxed));
+            retry_now_button(ui, true, || retry_requested.store(true, Ordering::Relaxed));
         });
 
         harness.get_by_label("Retry now").click();

@@ -157,7 +157,7 @@ fn synchronize_once(
 
             if let Some(time) = ntp_sys.map(DateTime::<Utc>::from) {
                 store_time_at_base(offset_ms, time, base_instant);
-                set_ntp_status(status_text, "NTP: Locked");
+                set_ntp_status(status_text, "NTP: Locked", false);
                 true
             } else {
                 use_system_time_fallback(
@@ -198,7 +198,7 @@ fn use_system_time_fallback(
     store_time_at_base(offset_ms, Utc::now(), base_instant);
     let status = format!("NTP Sync Error: {error}; falling back to system time");
 
-    set_ntp_status(status_text, &status);
+    set_ntp_status(status_text, &status, true);
 }
 
 pub(crate) fn store_time_at_base(
