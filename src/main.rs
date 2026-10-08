@@ -283,6 +283,10 @@ fn initialize_audio_stream(app: &LtcApp) -> Result<cpal::Stream, String> {
                 .default_output_config()
                 .map_err(|error| format!("Could not read audio output config: {error}"))?;
             let sample_rate = config.sample_rate();
+            let channels = usize::from(config.channels());
+            if channels == 0 {
+                return Err("Audio output config has zero channels".to_owned());
+            }
             let stream_config = config.into();
             let shared_fps = app.shared_fps.clone();
             let shared_timezone = app.shared_timezone.clone();
@@ -294,6 +298,7 @@ fn initialize_audio_stream(app: &LtcApp) -> Result<cpal::Stream, String> {
             let mut ltc_gen = LtcGenerator::new(sample_rate, generator_fps.to_oximedia_fps());
             let mut latched_timecode = None;
             let mut samples_until_frame_boundary = 0;
+            let mut mono_scratch = Vec::new();
 
             device
                 .build_output_stream(
@@ -322,36 +327,41 @@ fn initialize_audio_stream(app: &LtcApp) -> Result<cpal::Stream, String> {
                         let timezone_index =
                             shared_timezone.load(Ordering::Relaxed) % TZ_VARIANTS.len();
                         let frame_samples = samples_per_ltc_frame(sample_rate, nominal_fps(fps));
-                        let mut sample_offset = 0;
-                        while sample_offset < data.len() {
-                            if samples_until_frame_boundary == 0 {
-                                let sample_time = callback_elapsed
-                                    + Duration::from_secs_f64(
-                                        sample_offset as f64 / f64::from(sample_rate),
-                                    );
-                                let Some(tc) =
-                                    timecode_at(offset, sample_time, timezone_index, fps)
-                                else {
-                                    data[sample_offset..].fill(0.0);
-                                    break;
-                                };
-                                latched_timecode = Some(tc);
-                                samples_until_frame_boundary = frame_samples;
-                            }
+                        let audio_frames = data.len() / channels;
 
-                            let chunk_len = samples_until_frame_boundary
-                                .min(data.len() - sample_offset);
-                            if let Some(tc) = latched_timecode.as_ref() {
-                                let _ = ltc_gen.generate(
-                                    tc,
-                                    &mut data[sample_offset..sample_offset + chunk_len],
-                                );
-                            }
-                            sample_offset += chunk_len;
-                            samples_until_frame_boundary -= chunk_len;
-                            if samples_until_frame_boundary == 0 {
-                                latched_timecode = None;
-                            }
+                        if channels == 1 {
+                            generate_ltc_frames(
+                                &mut data[..audio_frames],
+                                &mut ltc_gen,
+                                &mut latched_timecode,
+                                &mut samples_until_frame_boundary,
+                                frame_samples,
+                                sample_rate,
+                                callback_elapsed,
+                                offset,
+                                timezone_index,
+                                fps,
+                            );
+                        } else {
+                            mono_scratch.resize(audio_frames, 0.0);
+                            generate_ltc_frames(
+                                &mut mono_scratch,
+                                &mut ltc_gen,
+                                &mut latched_timecode,
+                                &mut samples_until_frame_boundary,
+                                frame_samples,
+                                sample_rate,
+                                callback_elapsed,
+                                offset,
+                                timezone_index,
+                                fps,
+                            );
+                            duplicate_mono_samples(
+                                &mono_scratch,
+                                &mut data[..audio_frames * channels],
+                                channels,
+                            );
+                            data[audio_frames * channels..].fill(0.0);
                         }
 
                         let gain = 10.0_f32
@@ -371,6 +381,60 @@ fn initialize_audio_stream(app: &LtcApp) -> Result<cpal::Stream, String> {
                 .map(|()| stream)
                 .map_err(|error| format!("Could not start audio output stream: {error}"))
         })
+}
+
+fn generate_ltc_frames(
+    data: &mut [f32],
+    ltc_gen: &mut LtcGenerator,
+    latched_timecode: &mut Option<Timecode>,
+    samples_until_frame_boundary: &mut usize,
+    frame_samples: usize,
+    sample_rate: u32,
+    callback_elapsed: Duration,
+    offset: i64,
+    timezone_index: usize,
+    fps: SelectedFps,
+) {
+    let mut sample_offset = 0;
+    while sample_offset < data.len() {
+        if *samples_until_frame_boundary == 0 {
+            let sample_time = callback_elapsed
+                + Duration::from_secs_f64(sample_offset as f64 / f64::from(sample_rate));
+            let Some(tc) = timecode_at(offset, sample_time, timezone_index, fps) else {
+                data[sample_offset..].fill(0.0);
+                break;
+            };
+            *latched_timecode = Some(tc);
+            *samples_until_frame_boundary = frame_samples;
+        }
+
+        let chunk_len = (*samples_until_frame_boundary).min(data.len() - sample_offset);
+        if let Some(tc) = latched_timecode.as_ref() {
+            let _ = ltc_gen.generate(tc, &mut data[sample_offset..sample_offset + chunk_len]);
+        }
+        sample_offset += chunk_len;
+        *samples_until_frame_boundary -= chunk_len;
+        if *samples_until_frame_boundary == 0 {
+            *latched_timecode = None;
+        }
+    }
+}
+
+fn duplicate_mono_samples(mono: &[f32], interleaved: &mut [f32], channels: usize) {
+    if channels == 0 {
+        interleaved.fill(0.0);
+        return;
+    }
+
+    let frames = mono.len().min(interleaved.len() / channels);
+    for (sample, frame) in mono
+        .iter()
+        .take(frames)
+        .zip(interleaved.chunks_exact_mut(channels))
+    {
+        frame.fill(*sample);
+    }
+    interleaved[frames * channels..].fill(0.0);
 }
 
 fn use_system_time_fallback(
@@ -698,7 +762,10 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{adjusted_system_time, nominal_fps, samples_per_ltc_frame, SelectedFps};
+    use super::{
+        adjusted_system_time, duplicate_mono_samples, nominal_fps, samples_per_ltc_frame,
+        SelectedFps,
+    };
     use std::time::{Duration, SystemTime};
 
     #[test]
@@ -749,5 +816,21 @@ mod tests {
         }
 
         assert_eq!(chunks, [1000, 838, 1162]);
+    }
+
+    #[test]
+    fn mono_ltc_samples_are_duplicated_across_output_channels() {
+        let mono = [0.25, -0.5, 1.0];
+
+        let mut stereo = [0.0; 6];
+        duplicate_mono_samples(&mono, &mut stereo, 2);
+        assert_eq!(stereo, [0.25, 0.25, -0.5, -0.5, 1.0, 1.0]);
+
+        let mut surround = [0.0; 9];
+        duplicate_mono_samples(&mono, &mut surround, 3);
+        assert_eq!(
+            surround,
+            [0.25, 0.25, 0.25, -0.5, -0.5, -0.5, 1.0, 1.0, 1.0]
+        );
     }
 }
