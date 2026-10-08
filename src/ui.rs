@@ -314,41 +314,13 @@ impl eframe::App for LtcApp {
 
             ui.add_space(12.0);
 
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(ui.available_width() * 0.1);
-                    if ui
-                        .add_enabled(
-                            audio_available,
-                            egui::Checkbox::new(
-                            &mut self.audio_enabled,
-                            egui::RichText::new("Enable LTC Audio Output")
-                                .size(18.0)
-                                .strong(),
-                            ),
-                        )
-                        .changed()
-                    {
-                        self.shared_enabled
-                            .store(self.audio_enabled, Ordering::Relaxed);
-                        let status = if self.audio_enabled {
-                            "Audio output stream is playing"
-                        } else {
-                            "Audio output ready (muted)"
-                        };
-                        set_audio_status(&self.status_text, status);
-                    }
-                });
-                if !audio_available {
-                    ui.label(
-                        egui::RichText::new(
-                            "Audio output unavailable. Connect an output device to enable this control.",
-                        )
-                        .small()
-                        .color(ui.visuals().error_fg_color),
-                    );
-                }
-            });
+            audio_output_control(
+                ui,
+                &mut self.audio_enabled,
+                audio_available,
+                &self.shared_enabled,
+                &self.status_text,
+            );
 
             let timezone_index = self.shared_timezone.load(Ordering::Relaxed) % TZ_VARIANTS.len();
             let clock_text = current_utc_time(
@@ -394,6 +366,49 @@ impl eframe::App for LtcApp {
     }
 }
 
+fn audio_output_control(
+    ui: &mut egui::Ui,
+    audio_enabled: &mut bool,
+    audio_available: bool,
+    shared_enabled: &AtomicBool,
+    status_text: &Mutex<StatusText>,
+) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.add_space(ui.available_width() * 0.1);
+            if ui
+                .add_enabled(
+                    audio_available,
+                    egui::Checkbox::new(
+                        audio_enabled,
+                        egui::RichText::new("Enable LTC Audio Output")
+                            .size(18.0)
+                            .strong(),
+                    ),
+                )
+                .changed()
+            {
+                shared_enabled.store(*audio_enabled, Ordering::Relaxed);
+                let status = if *audio_enabled {
+                    "Audio output stream is playing"
+                } else {
+                    "Audio output ready (muted)"
+                };
+                set_audio_status(status_text, status);
+            }
+        });
+        if !audio_available {
+            ui.label(
+                egui::RichText::new(
+                    "Audio output unavailable. Connect an output device to enable this control.",
+                )
+                .small()
+                .color(ui.visuals().error_fg_color),
+            );
+        }
+    });
+}
+
 pub(crate) fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([360.0, 500.0]),
@@ -404,4 +419,39 @@ pub(crate) fn run() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(LtcApp::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::accesskit::Toggled;
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT, Queryable},
+    };
+
+    #[test]
+    fn enabling_audio_output_updates_the_app_and_status() {
+        let mut audio_enabled = false;
+        let shared_enabled = AtomicBool::new(false);
+        let status_text = Mutex::new(StatusText::new("NTP: Locked"));
+        let mut harness = Harness::new_ui(|ui| {
+            audio_output_control(ui, &mut audio_enabled, true, &shared_enabled, &status_text);
+        });
+
+        let checkbox = harness.get_by_label("Enable LTC Audio Output");
+        assert_eq!(checkbox.accesskit_node().toggled(), Some(Toggled::False));
+        checkbox.click();
+        harness.run();
+
+        let checkbox = harness.get_by_label("Enable LTC Audio Output");
+        assert_eq!(checkbox.accesskit_node().toggled(), Some(Toggled::True));
+        drop(harness);
+        assert!(audio_enabled);
+        assert!(shared_enabled.load(Ordering::Relaxed));
+        assert_eq!(
+            status_text.lock().unwrap().combined(),
+            "NTP: Locked | Audio output: Audio output stream is playing"
+        );
+    }
 }
