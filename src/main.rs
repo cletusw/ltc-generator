@@ -9,7 +9,7 @@ use oximedia_timesync::timecode::ltc::LtcGenerator;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -190,10 +190,8 @@ impl LtcApp {
                                 None
                             };
 
-                            if let Some(dur) =
-                                ntp_sys.and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                            {
-                                offset_clone.store(dur.as_millis() as i64, Ordering::Relaxed);
+                            if let Some(time) = ntp_sys.map(DateTime::<Utc>::from) {
+                                offset_clone.store(time.timestamp_millis(), Ordering::Relaxed);
                                 if let Ok(mut status) = status_clone.lock() {
                                     *status = "NTP Locked (pool.ntp.org)".into();
                                 }
@@ -238,13 +236,16 @@ impl LtcApp {
                             }
 
                             let fps = SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
-                            let base_offset = offset_ms.load(Ordering::Relaxed);
-                            let current_time =
-                                Duration::from_millis(base_offset as u64) + base_instant.elapsed();
                             let timezone_index =
                                 shared_timezone.load(Ordering::Relaxed) % TZ_VARIANTS.len();
-                            let local_time = DateTime::<Utc>::from(UNIX_EPOCH + current_time)
-                                .with_timezone(&TZ_VARIANTS[timezone_index]);
+                            let Some(local_time) = current_utc_time(
+                                offset_ms.load(Ordering::Relaxed),
+                                base_instant.elapsed(),
+                            )
+                            .map(|time| time.with_timezone(&TZ_VARIANTS[timezone_index])) else {
+                                data.fill(0.0);
+                                return;
+                            };
                             let h = local_time.hour() as u8;
                             let m = local_time.minute() as u8;
                             let s = local_time.second() as u8;
@@ -286,16 +287,8 @@ fn use_system_time_fallback(
     status_text: &Mutex<String>,
     error: impl std::fmt::Display,
 ) {
-    let status = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(system_time) => {
-            offset_ms.store(system_time.as_millis() as i64, Ordering::Relaxed);
-            format!("NTP Sync Error: {}; falling back to system time", error)
-        }
-        Err(clock_error) => format!(
-            "NTP Sync Error: {}; system time unavailable: {}",
-            error, clock_error
-        ),
-    };
+    offset_ms.store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+    let status = format!("NTP Sync Error: {}; falling back to system time", error);
 
     if let Ok(mut current_status) = status_text.lock() {
         *current_status = status;
@@ -377,30 +370,40 @@ impl eframe::App for LtcApp {
 
             ui.add_space(12.0);
 
-            let current_wall = Duration::from_millis(self.offset_ms.load(Ordering::Relaxed) as u64)
-                + self.local_base.elapsed();
             let timezone_index = self.shared_timezone.load(Ordering::Relaxed) % TZ_VARIANTS.len();
-            let local_time = DateTime::<Utc>::from(UNIX_EPOCH + current_wall)
-                .with_timezone(&TZ_VARIANTS[timezone_index]);
+            let clock_text = current_utc_time(
+                self.offset_ms.load(Ordering::Relaxed),
+                self.local_base.elapsed(),
+            )
+            .map(|time| time.with_timezone(&TZ_VARIANTS[timezone_index]))
+            .map(|time| {
+                format!(
+                    "{:02}:{:02}:{:02}",
+                    time.hour(),
+                    time.minute(),
+                    time.second()
+                )
+            })
+            .unwrap_or_else(|| "Invalid time".to_owned());
 
             // Simplified display: HH:MM:SS
             ui.group(|ui| {
                 ui.centered_and_justified(|ui| {
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{:02}:{:02}:{:02}",
-                            local_time.hour(),
-                            local_time.minute(),
-                            local_time.second()
-                        ))
-                        .size(42.0)
-                        .monospace()
-                        .strong(),
+                        egui::RichText::new(clock_text)
+                            .size(42.0)
+                            .monospace()
+                            .strong(),
                     );
                 });
             });
         });
     }
+}
+
+fn current_utc_time(offset_ms: i64, elapsed: Duration) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp_millis(offset_ms)?
+        .checked_add_signed(chrono::Duration::from_std(elapsed).ok()?)
 }
 
 fn system_timezone_name() -> String {
