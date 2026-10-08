@@ -231,17 +231,7 @@ fn start_ntp_sync(
 
                 match result {
                     Ok(sync) => {
-                        let ntp_sys = if sync.offset.is_finite() {
-                            let now = SystemTime::now();
-                            let adjustment = Duration::from_secs_f64(sync.offset.abs());
-                            if sync.offset < 0.0 {
-                                now.checked_sub(adjustment)
-                            } else {
-                                now.checked_add(adjustment)
-                            }
-                        } else {
-                            None
-                        };
+                        let ntp_sys = adjusted_system_time(sync.offset, SystemTime::now());
 
                         if let Some(time) = ntp_sys.map(DateTime::<Utc>::from) {
                             store_time_at_base(&offset_ms, time, base_instant);
@@ -265,6 +255,19 @@ fn start_ntp_sync(
             }
         }
     });
+}
+
+fn adjusted_system_time(offset: f64, now: SystemTime) -> Option<SystemTime> {
+    if !offset.is_finite() {
+        return None;
+    }
+
+    let adjustment = Duration::try_from_secs_f64(offset.abs()).ok()?;
+    if offset < 0.0 {
+        now.checked_sub(adjustment)
+    } else {
+        now.checked_add(adjustment)
+    }
 }
 
 fn initialize_audio_stream(app: &LtcApp) -> Result<cpal::Stream, String> {
@@ -695,7 +698,29 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{nominal_fps, samples_per_ltc_frame, SelectedFps};
+    use super::{adjusted_system_time, nominal_fps, samples_per_ltc_frame, SelectedFps};
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn ntp_offset_adjusts_system_time_safely() {
+        let now = SystemTime::UNIX_EPOCH;
+        assert_eq!(
+            adjusted_system_time(1.25, now),
+            Some(now + Duration::from_millis(1250))
+        );
+        assert_eq!(
+            adjusted_system_time(-1.25, now + Duration::from_secs(2)),
+            Some(now + Duration::from_millis(750))
+        );
+    }
+
+    #[test]
+    fn invalid_or_out_of_range_ntp_offsets_are_rejected() {
+        let now = SystemTime::UNIX_EPOCH;
+        for offset in [f64::MAX, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert_eq!(adjusted_system_time(offset, now), None);
+        }
+    }
 
     #[test]
     fn fractional_samples_per_frame_round_up_like_ltc_generator() {
