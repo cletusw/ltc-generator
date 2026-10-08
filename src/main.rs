@@ -2,10 +2,10 @@ use chrono::{DateTime, Timelike, Utc};
 use chrono_tz::TZ_VARIANTS;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
+use oximedia_timecode::ltc_encoder::LtcBitEncoder;
 use oximedia_timecode::{FrameRate as OxiFrameRate, Timecode};
 use oximedia_timesync::NtpClient;
 use oximedia_timesync::ntp::client::NtpClientConfig;
-use oximedia_timesync::timecode::ltc::LtcGenerator;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,6 +39,15 @@ impl SelectedFps {
             SelectedFps::Fps2997Ndf => OxiFrameRate::Fps2997NDF,
             SelectedFps::Fps2997Df => OxiFrameRate::Fps2997DF,
             SelectedFps::Fps30 => OxiFrameRate::Fps30,
+        }
+    }
+
+    fn ratio(self) -> (u64, u64) {
+        match self {
+            SelectedFps::Fps24 => (24, 1),
+            SelectedFps::Fps25 => (25, 1),
+            SelectedFps::Fps2997Ndf | SelectedFps::Fps2997Df => (30_000, 1_001),
+            SelectedFps::Fps30 => (30, 1),
         }
     }
 
@@ -116,9 +125,7 @@ impl Default for LtcApp {
             shared_volume_dbfs: Arc::new(AtomicI32::new(-18)),
             offset_ms,
             local_base,
-            status_text: Arc::new(Mutex::new(
-                "NTP: Syncing via OxiMedia NTP...".into(),
-            )),
+            status_text: Arc::new(Mutex::new("NTP: Syncing via OxiMedia NTP...".into())),
             _stream: None,
         }
     }
@@ -165,7 +172,10 @@ impl LtcApp {
             Err(error) => {
                 app.audio_enabled = false;
                 app.shared_enabled.store(false, Ordering::Relaxed);
-                set_audio_status(&app.status_text, &format!("Audio output unavailable: {error}"));
+                set_audio_status(
+                    &app.status_text,
+                    &format!("Audio output unavailable: {error}"),
+                );
             }
         }
 
@@ -295,8 +305,8 @@ fn initialize_audio_stream(app: &LtcApp) -> Result<cpal::Stream, String> {
             let offset_ms = app.offset_ms.clone();
             let base_instant = app.local_base;
             let mut generator_fps = SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
-            let mut ltc_gen = LtcGenerator::new(sample_rate, generator_fps.to_oximedia_fps());
-            let mut latched_timecode = None;
+            let mut ltc_gen = LtcBiphaseMarkGenerator::new(sample_rate, generator_fps);
+            let mut frame_clock = LtcFrameClock::new(sample_rate, generator_fps);
             let mut samples_until_frame_boundary = 0;
             let mut mono_scratch = Vec::new();
 
@@ -305,37 +315,31 @@ fn initialize_audio_stream(app: &LtcApp) -> Result<cpal::Stream, String> {
                     stream_config,
                     move |data: &mut [f32], _| {
                         if !shared_enabled_flag.load(Ordering::Relaxed) {
-                            for sample in data.iter_mut() {
-                                *sample = 0.0;
-                            }
+                            data.fill(0.0);
+                            samples_until_frame_boundary = 0;
                             return;
                         }
 
                         let fps = SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
-                        let frame_rate_enum = fps.to_oximedia_fps();
                         if fps != generator_fps {
-                            ltc_gen = LtcGenerator::new(sample_rate, frame_rate_enum);
+                            ltc_gen = LtcBiphaseMarkGenerator::new(sample_rate, fps);
+                            frame_clock = LtcFrameClock::new(sample_rate, fps);
                             generator_fps = fps;
-                            latched_timecode = None;
                             samples_until_frame_boundary = 0;
                         }
 
-                        // LtcGenerator re-encodes on every `generate` call, so never
-                        // give it a new timecode until its current 80-bit frame ends.
                         let offset = offset_ms.load(Ordering::Relaxed);
                         let callback_elapsed = base_instant.elapsed();
                         let timezone_index =
                             shared_timezone.load(Ordering::Relaxed) % TZ_VARIANTS.len();
-                        let frame_samples = samples_per_ltc_frame(sample_rate, nominal_fps(fps));
                         let audio_frames = data.len() / channels;
 
                         if channels == 1 {
                             generate_ltc_frames(
                                 &mut data[..audio_frames],
                                 &mut ltc_gen,
-                                &mut latched_timecode,
+                                &mut frame_clock,
                                 &mut samples_until_frame_boundary,
-                                frame_samples,
                                 sample_rate,
                                 callback_elapsed,
                                 offset,
@@ -347,9 +351,8 @@ fn initialize_audio_stream(app: &LtcApp) -> Result<cpal::Stream, String> {
                             generate_ltc_frames(
                                 &mut mono_scratch,
                                 &mut ltc_gen,
-                                &mut latched_timecode,
+                                &mut frame_clock,
                                 &mut samples_until_frame_boundary,
-                                frame_samples,
                                 sample_rate,
                                 callback_elapsed,
                                 offset,
@@ -364,8 +367,8 @@ fn initialize_audio_stream(app: &LtcApp) -> Result<cpal::Stream, String> {
                             data[audio_frames * channels..].fill(0.0);
                         }
 
-                        let gain = 10.0_f32
-                            .powf(shared_volume_dbfs.load(Ordering::Relaxed) as f32 / 20.0);
+                        let gain =
+                            10.0_f32.powf(shared_volume_dbfs.load(Ordering::Relaxed) as f32 / 20.0);
                         for sample in data.iter_mut() {
                             *sample *= gain;
                         }
@@ -385,10 +388,9 @@ fn initialize_audio_stream(app: &LtcApp) -> Result<cpal::Stream, String> {
 
 fn generate_ltc_frames(
     data: &mut [f32],
-    ltc_gen: &mut LtcGenerator,
-    latched_timecode: &mut Option<Timecode>,
+    ltc_gen: &mut LtcBiphaseMarkGenerator,
+    frame_clock: &mut LtcFrameClock,
     samples_until_frame_boundary: &mut usize,
-    frame_samples: usize,
     sample_rate: u32,
     callback_elapsed: Duration,
     offset: i64,
@@ -404,19 +406,14 @@ fn generate_ltc_frames(
                 data[sample_offset..].fill(0.0);
                 break;
             };
-            *latched_timecode = Some(tc);
-            *samples_until_frame_boundary = frame_samples;
+            ltc_gen.begin_frame(&tc);
+            *samples_until_frame_boundary = frame_clock.next_frame_samples();
         }
 
         let chunk_len = (*samples_until_frame_boundary).min(data.len() - sample_offset);
-        if let Some(tc) = latched_timecode.as_ref() {
-            let _ = ltc_gen.generate(tc, &mut data[sample_offset..sample_offset + chunk_len]);
-        }
+        ltc_gen.generate(&mut data[sample_offset..sample_offset + chunk_len]);
         sample_offset += chunk_len;
         *samples_until_frame_boundary -= chunk_len;
-        if *samples_until_frame_boundary == 0 {
-            *latched_timecode = None;
-        }
     }
 }
 
@@ -435,6 +432,87 @@ fn duplicate_mono_samples(mono: &[f32], interleaved: &mut [f32], channels: usize
         frame.fill(*sample);
     }
     interleaved[frames * channels..].fill(0.0);
+}
+
+struct LtcBiphaseMarkGenerator {
+    sample_rate: u32,
+    fps: SelectedFps,
+    bits: [u8; 80],
+    sample_in_frame: usize,
+    bit_position: usize,
+    polarity: f32,
+    mid_transition_done: bool,
+}
+
+impl LtcBiphaseMarkGenerator {
+    fn new(sample_rate: u32, fps: SelectedFps) -> Self {
+        Self {
+            sample_rate,
+            fps,
+            bits: [0; 80],
+            sample_in_frame: 0,
+            bit_position: 0,
+            polarity: 1.0,
+            mid_transition_done: false,
+        }
+    }
+
+    fn begin_frame(&mut self, timecode: &Timecode) {
+        self.bits = LtcBitEncoder::encode(timecode);
+        self.sample_in_frame = 0;
+        self.bit_position = 0;
+        self.mid_transition_done = false;
+    }
+
+    fn generate(&mut self, samples: &mut [f32]) {
+        let samples_per_bit =
+            f64::from(self.sample_rate) / (80.0 * self.fps.to_oximedia_fps().as_float());
+
+        for sample in samples {
+            let current_bit = (self.sample_in_frame as f64 / samples_per_bit) as usize;
+            while self.bit_position <= current_bit && self.bit_position < self.bits.len() {
+                self.polarity = -self.polarity;
+                self.bit_position += 1;
+                self.mid_transition_done = false;
+            }
+
+            if current_bit < self.bits.len()
+                && self.bits[current_bit] == 1
+                && !self.mid_transition_done
+                && self.sample_in_frame as f64 >= (current_bit as f64 + 0.5) * samples_per_bit
+            {
+                self.polarity = -self.polarity;
+                self.mid_transition_done = true;
+            }
+
+            *sample = self.polarity;
+            self.sample_in_frame += 1;
+        }
+    }
+}
+
+struct LtcFrameClock {
+    samples_per_frame_numerator: u64,
+    frames_per_second_numerator: u64,
+    rounding_error: u64,
+}
+
+impl LtcFrameClock {
+    fn new(sample_rate: u32, fps: SelectedFps) -> Self {
+        let (fps_numerator, fps_denominator) = fps.ratio();
+        Self {
+            samples_per_frame_numerator: u64::from(sample_rate) * fps_denominator,
+            frames_per_second_numerator: fps_numerator,
+            rounding_error: 0,
+        }
+    }
+
+    fn next_frame_samples(&mut self) -> usize {
+        let adjusted_numerator = self.samples_per_frame_numerator - self.rounding_error;
+        let samples = adjusted_numerator.div_ceil(self.frames_per_second_numerator);
+        self.rounding_error = samples * self.frames_per_second_numerator - adjusted_numerator;
+        samples as usize
+    }
 }
 
 fn use_system_time_fallback(
@@ -706,36 +784,12 @@ fn timecode_at(
 ) -> Option<Timecode> {
     let local_time = current_utc_time(offset_ms, elapsed)?
         .with_timezone(&TZ_VARIANTS[timezone_index % TZ_VARIANTS.len()]);
-    let frames_per_sec = match fps {
-        SelectedFps::Fps24 => 24.0,
-        SelectedFps::Fps25 => 25.0,
-        SelectedFps::Fps2997Ndf | SelectedFps::Fps2997Df => 29.97,
-        SelectedFps::Fps30 => 30.0,
-    };
-    let frames =
-        ((local_time.timestamp_subsec_millis() as f32 / 1000.0) * frames_per_sec) as u8;
-    Timecode::new(
-        local_time.hour() as u8,
-        local_time.minute() as u8,
-        local_time.second() as u8,
-        frames,
-        fps.to_oximedia_fps(),
-    )
-    .ok()
-}
-
-fn nominal_fps(fps: SelectedFps) -> u32 {
-    match fps {
-        SelectedFps::Fps24 => 24,
-        SelectedFps::Fps25 => 25,
-        SelectedFps::Fps2997Ndf | SelectedFps::Fps2997Df | SelectedFps::Fps30 => 30,
-    }
-}
-
-fn samples_per_ltc_frame(sample_rate: u32, nominal_fps: u32) -> usize {
-    // LtcGenerator uses the rounded Timecode frame rate and resets its phase
-    // after the first whole sample at or beyond the nominal frame duration.
-    sample_rate.div_ceil(nominal_fps) as usize
+    let elapsed_ns = (i128::from(local_time.num_seconds_from_midnight()) * 1_000_000_000)
+        + i128::from(local_time.timestamp_subsec_nanos());
+    let (fps_numerator, fps_denominator) = fps.ratio();
+    let frame_number = (elapsed_ns * i128::from(fps_numerator)
+        / (1_000_000_000 * i128::from(fps_denominator))) as u64;
+    Timecode::from_frames(frame_number, fps.to_oximedia_fps()).ok()
 }
 
 fn system_timezone_name() -> String {
@@ -763,8 +817,8 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        adjusted_system_time, duplicate_mono_samples, nominal_fps, samples_per_ltc_frame,
-        SelectedFps,
+        LtcBiphaseMarkGenerator, LtcFrameClock, SelectedFps, adjusted_system_time,
+        duplicate_mono_samples,
     };
     use std::time::{Duration, SystemTime};
 
@@ -790,17 +844,31 @@ mod tests {
     }
 
     #[test]
-    fn fractional_samples_per_frame_round_up_like_ltc_generator() {
-        // 44.1 kHz / 24 fps is 1837.5 samples. The generator resets phase
-        // after 1838 samples, rather than carrying the half-sample forward.
-        assert_eq!(samples_per_ltc_frame(44_100, nominal_fps(SelectedFps::Fps24)), 1838);
-        assert_eq!(samples_per_ltc_frame(48_000, nominal_fps(SelectedFps::Fps2997Df)), 1600);
+    fn fractional_frame_lengths_preserve_the_selected_frame_rate() {
+        let mut fps24_clock = LtcFrameClock::new(44_100, SelectedFps::Fps24);
+        assert_eq!(
+            [
+                fps24_clock.next_frame_samples(),
+                fps24_clock.next_frame_samples()
+            ],
+            [1838, 1837]
+        );
+
+        let mut fps2997_clock = LtcFrameClock::new(48_000, SelectedFps::Fps2997Df);
+        let frame_lengths = [
+            fps2997_clock.next_frame_samples(),
+            fps2997_clock.next_frame_samples(),
+            fps2997_clock.next_frame_samples(),
+            fps2997_clock.next_frame_samples(),
+            fps2997_clock.next_frame_samples(),
+        ];
+        assert_eq!(frame_lengths.iter().sum::<usize>(), 8008);
     }
 
     #[test]
     fn frame_chunking_splits_buffers_at_ltc_frame_boundaries() {
-        let frame_samples = samples_per_ltc_frame(44_100, nominal_fps(SelectedFps::Fps24));
-        let mut samples_until_boundary = frame_samples;
+        let mut frame_clock = LtcFrameClock::new(44_100, SelectedFps::Fps24);
+        let mut samples_until_boundary = frame_clock.next_frame_samples();
         let mut chunks = Vec::new();
         for buffer_samples in [1000, 2000] {
             let mut remaining = buffer_samples;
@@ -810,12 +878,30 @@ mod tests {
                 remaining -= chunk;
                 samples_until_boundary -= chunk;
                 if samples_until_boundary == 0 {
-                    samples_until_boundary = frame_samples;
+                    samples_until_boundary = frame_clock.next_frame_samples();
                 }
             }
         }
 
         assert_eq!(chunks, [1000, 838, 1162]);
+    }
+
+    #[test]
+    fn ltc_waveform_has_biphase_mark_transitions() {
+        let mut generator = LtcBiphaseMarkGenerator::new(48_000, SelectedFps::Fps24);
+        generator.bits = [0; 80];
+        generator.bits[1] = 1;
+        let mut samples = [0.0; 51];
+
+        generator.generate(&mut samples);
+
+        assert_eq!(samples[0], -1.0);
+        assert_eq!(samples[24], -1.0);
+        assert_eq!(samples[25], 1.0);
+        assert_eq!(samples[37], 1.0);
+        assert_eq!(samples[38], -1.0);
+        assert_eq!(samples[49], -1.0);
+        assert_eq!(samples[50], 1.0);
     }
 
     #[test]
