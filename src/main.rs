@@ -116,7 +116,9 @@ impl Default for LtcApp {
             shared_volume_dbfs: Arc::new(AtomicI32::new(-18)),
             offset_ms,
             local_base,
-            status_text: Arc::new(Mutex::new("Syncing via OxiMedia NTP...".into())),
+            status_text: Arc::new(Mutex::new(
+                "NTP: Syncing via OxiMedia NTP...".into(),
+            )),
             _stream: None,
         }
     }
@@ -218,9 +220,7 @@ impl LtcApp {
 
                             if let Some(time) = ntp_sys.map(DateTime::<Utc>::from) {
                                 store_time_at_base(&offset_clone, time, base_instant);
-                                if let Ok(mut status) = status_clone.lock() {
-                                    *status = "NTP Locked (pool.ntp.org)".into();
-                                }
+                                set_ntp_status(&status_clone, "NTP Locked (pool.ntp.org)");
                             } else {
                                 use_system_time_fallback(
                                     &offset_clone,
@@ -247,23 +247,30 @@ impl LtcApp {
         });
 
         // Audio Stream Initialization
-        if let Ok(host) = std::panic::catch_unwind(cpal::default_host) {
-            if let Some(device) = host.default_output_device() {
-                if let Ok(config) = device.default_output_config() {
-                    let sample_rate = config.sample_rate();
-                    let stream_config = config.into();
-                    let shared_fps = app.shared_fps.clone();
-                    let shared_timezone = app.shared_timezone.clone();
-                    let shared_enabled_flag = app.shared_enabled.clone();
-                    let shared_volume_dbfs = app.shared_volume_dbfs.clone();
-                    let offset_ms = app.offset_ms.clone();
-                    let base_instant = app.local_base;
-                    let mut generator_fps =
-                        SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
-                    let mut ltc_gen =
-                        LtcGenerator::new(sample_rate, generator_fps.to_oximedia_fps());
+        let audio_result = std::panic::catch_unwind(cpal::default_host)
+            .map_err(|_| "Audio host initialization panicked".to_owned())
+            .and_then(|host| {
+                host.default_output_device()
+                    .ok_or_else(|| "No default audio output device is available".to_owned())
+            })
+            .and_then(|device| {
+                let config = device
+                    .default_output_config()
+                    .map_err(|error| format!("Could not read audio output config: {error}"))?;
+                let sample_rate = config.sample_rate();
+                let stream_config = config.into();
+                let shared_fps = app.shared_fps.clone();
+                let shared_timezone = app.shared_timezone.clone();
+                let shared_enabled_flag = app.shared_enabled.clone();
+                let shared_volume_dbfs = app.shared_volume_dbfs.clone();
+                let offset_ms = app.offset_ms.clone();
+                let base_instant = app.local_base;
+                let mut generator_fps =
+                    SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
+                let mut ltc_gen = LtcGenerator::new(sample_rate, generator_fps.to_oximedia_fps());
 
-                    let stream = device.build_output_stream(
+                device
+                    .build_output_stream(
                         stream_config,
                         move |data: &mut [f32], _| {
                             if !shared_enabled_flag.load(Ordering::Relaxed) {
@@ -314,13 +321,25 @@ impl LtcApp {
                         },
                         |_| {},
                         None,
-                    );
+                    )
+                    .map_err(|error| format!("Could not build audio output stream: {error}"))
+            })
+            .and_then(|stream| {
+                stream
+                    .play()
+                    .map(|()| stream)
+                    .map_err(|error| format!("Could not start audio output stream: {error}"))
+            });
 
-                    if let Ok(s) = stream {
-                        let _ = s.play();
-                        app._stream = Some(s);
-                    }
-                }
+        match audio_result {
+            Ok(stream) => {
+                app._stream = Some(stream);
+                set_audio_status(&app.status_text, "Audio output stream is playing");
+            }
+            Err(error) => {
+                app.audio_enabled = false;
+                app.shared_enabled.store(false, Ordering::Relaxed);
+                set_audio_status(&app.status_text, &format!("Audio output unavailable: {error}"));
             }
         }
 
@@ -337,8 +356,33 @@ fn use_system_time_fallback(
     store_time_at_base(offset_ms, Utc::now(), base_instant);
     let status = format!("NTP Sync Error: {}; falling back to system time", error);
 
-    if let Ok(mut current_status) = status_text.lock() {
-        *current_status = status;
+    set_ntp_status(status_text, &status);
+}
+
+fn set_ntp_status(status_text: &Mutex<String>, message: &str) {
+    const AUDIO_STATUS_SEPARATOR: &str = " | Audio output: ";
+
+    if let Ok(mut status) = status_text.lock() {
+        let audio_status = status
+            .split_once(AUDIO_STATUS_SEPARATOR)
+            .map(|(_, audio_status)| audio_status);
+        *status = match audio_status {
+            Some(audio_status) => format!("{message}{AUDIO_STATUS_SEPARATOR}{audio_status}"),
+            None => message.to_owned(),
+        };
+    }
+}
+
+fn set_audio_status(status_text: &Mutex<String>, message: &str) {
+    const AUDIO_STATUS_SEPARATOR: &str = " | Audio output: ";
+
+    if let Ok(mut status) = status_text.lock() {
+        let ntp_status = status
+            .split_once(AUDIO_STATUS_SEPARATOR)
+            .map(|(ntp_status, _)| ntp_status)
+            .unwrap_or(status.as_str())
+            .to_owned();
+        *status = format!("{ntp_status}{AUDIO_STATUS_SEPARATOR}{message}");
     }
 }
 
