@@ -579,15 +579,16 @@ impl eframe::App for LtcApp {
             .map(|time| time.with_timezone(&TZ_VARIANTS[timezone_index]))
             .map(|time| {
                 format!(
-                    "{:02}:{:02}:{:02}",
+                    "{:02}:{:02}:{:02}.{}",
                     time.hour(),
                     time.minute(),
-                    time.second()
+                    time.second(),
+                    time.timestamp_subsec_millis() / 100
                 )
             })
             .unwrap_or_else(|| "Invalid time".to_owned());
 
-            // Simplified display: HH:MM:SS
+            // Display tenths of a second; the repaint interval is 100 ms.
             ui.group(|ui| {
                 ui.centered_and_justified(|ui| {
                     ui.label(
