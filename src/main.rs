@@ -218,7 +218,8 @@ impl LtcApp {
         if let Ok(host) = std::panic::catch_unwind(cpal::default_host) {
             if let Some(device) = host.default_output_device() {
                 if let Ok(config) = device.default_output_config() {
-                    let sample_rate = config.sample_rate().0;
+                    let sample_rate = config.sample_rate();
+                    let stream_config = config.into();
                     let shared_fps = app.shared_fps.clone();
                     let shared_timezone = app.shared_timezone.clone();
                     let shared_enabled_flag = app.shared_enabled.clone();
@@ -226,7 +227,7 @@ impl LtcApp {
                     let base_instant = app.local_base;
 
                     let stream = device.build_output_stream(
-                        &config.into(),
+                        stream_config,
                         move |data: &mut [f32], _| {
                             if !shared_enabled_flag.load(Ordering::Relaxed) {
                                 for sample in data.iter_mut() {
