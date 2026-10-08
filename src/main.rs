@@ -64,6 +64,14 @@ impl Default for SelectedFps {
 pub struct LtcApp {
     selected_fps: SelectedFps,
     selected_timezone: String,
+    #[serde(skip)]
+    timezone_search: String,
+    #[serde(skip)]
+    timezone_picker_open: bool,
+    #[serde(skip)]
+    timezone_search_needs_focus: bool,
+    #[serde(skip)]
+    timezone_scroll_to_selection: bool,
     audio_enabled: bool,
 
     #[serde(skip)]
@@ -87,6 +95,10 @@ impl Default for LtcApp {
         Self {
             selected_fps: SelectedFps::Fps2997Df,
             selected_timezone: system_timezone_name(),
+            timezone_search: String::new(),
+            timezone_picker_open: false,
+            timezone_search_needs_focus: false,
+            timezone_scroll_to_selection: false,
             audio_enabled: true,
             shared_fps: Arc::new(AtomicU8::new(SelectedFps::Fps2997Df as u8)),
             shared_timezone: Arc::new(AtomicUsize::new(
@@ -333,33 +345,123 @@ impl eframe::App for LtcApp {
                         }
                     });
 
-                ui.horizontal(|ui| {
-                    ui.label("Timezone:");
-                    let previous_timezone = self.selected_timezone.clone();
-                    egui::ComboBox::from_id_source("timezone_selector")
-                        .selected_text(&self.selected_timezone)
-                        .show_ui(ui, |ui| {
-                            for timezone in TZ_VARIANTS {
-                                let timezone_name = timezone.to_string();
-                                ui.selectable_value(
-                                    &mut self.selected_timezone,
-                                    timezone_name.clone(),
-                                    timezone_name,
-                                );
-                            }
-                        });
-                    if previous_timezone != self.selected_timezone {
-                        if let Some(index) = timezone_index(&self.selected_timezone) {
-                            self.shared_timezone.store(index, Ordering::Relaxed);
-                        }
-                    }
-                });
-
                 if prev != self.selected_fps {
                     self.shared_fps
                         .store(self.selected_fps as u8, Ordering::Relaxed);
                 }
             });
+
+            let mut timezone_picker_pos = None;
+            let mut timezone_control_rect = None;
+            ui.horizontal(|ui| {
+                ui.label("Timezone:");
+                let previous_timezone = self.selected_timezone.clone();
+                if self.timezone_picker_open {
+                    let search_field = ui.add_sized(
+                        [220.0, ui.spacing().interact_size.y],
+                        egui::TextEdit::singleline(&mut self.timezone_search)
+                            .id_source("timezone_search"),
+                    );
+                    timezone_picker_pos = Some(search_field.rect.left_bottom());
+                    timezone_control_rect = Some(search_field.rect);
+                    if self.timezone_search_needs_focus || search_field.clicked() {
+                        search_field.request_focus();
+                        self.timezone_search_needs_focus = false;
+                    }
+                } else {
+                    let selector = ui.add_sized(
+                        [220.0, ui.spacing().interact_size.y],
+                        egui::Button::new(&self.selected_timezone),
+                    );
+                    timezone_control_rect = Some(selector.rect);
+                    if selector.clicked() {
+                        self.timezone_search.clear();
+                        self.timezone_picker_open = true;
+                        self.timezone_search_needs_focus = true;
+                        self.timezone_scroll_to_selection = true;
+                    }
+                }
+
+                if ui.button("System default").clicked() {
+                    self.selected_timezone = system_timezone_name();
+                    self.timezone_picker_open = false;
+                }
+
+                if previous_timezone != self.selected_timezone {
+                    self.timezone_search.clear();
+                }
+            });
+
+            let mut timezone_popup_rect = None;
+            if self.timezone_picker_open {
+                if let Some(position) = timezone_picker_pos {
+                    let search = self.timezone_search.to_lowercase();
+                    let popup = egui::Area::new(egui::Id::new("timezone_picker_popup"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(position + egui::vec2(0.0, 4.0))
+                        .show(ctx, |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(260.0);
+                                let mut selected = None;
+                                egui::ScrollArea::vertical()
+                                    .id_source("timezone_results")
+                                    .min_scrolled_height(240.0)
+                                    .max_height(240.0)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        for timezone in TZ_VARIANTS {
+                                            let timezone_name = timezone.to_string();
+                                            if !timezone_name.to_lowercase().contains(&search) {
+                                                continue;
+                                            }
+                                            let response = ui.selectable_label(
+                                                self.selected_timezone == timezone_name,
+                                                &timezone_name,
+                                            );
+                                            if self.timezone_scroll_to_selection
+                                                && self.selected_timezone == timezone_name
+                                            {
+                                                response.scroll_to_me(Some(egui::Align::Center));
+                                                self.timezone_scroll_to_selection = false;
+                                            }
+                                            if response.clicked() {
+                                                selected = Some(timezone_name);
+                                            }
+                                        }
+                                    });
+                                if let Some(timezone) = selected {
+                                    self.selected_timezone = timezone;
+                                    self.timezone_picker_open = false;
+                                    self.timezone_search.clear();
+                                }
+                            })
+                        });
+                    timezone_popup_rect =
+                        Some(popup.response.rect.union(popup.inner.response.rect));
+                }
+            }
+            if self.timezone_picker_open
+                && ctx.input(|input| {
+                    input.key_pressed(egui::Key::Enter) || input.key_pressed(egui::Key::Escape)
+                })
+            {
+                self.timezone_picker_open = false;
+            }
+            if self.timezone_picker_open {
+                let click_outside = ctx.input(|input| {
+                    input.pointer.button_clicked(egui::PointerButton::Primary)
+                        && input.pointer.interact_pos().is_some_and(|position| {
+                            !timezone_control_rect.is_some_and(|rect| rect.contains(position))
+                                && !timezone_popup_rect.is_some_and(|rect| rect.contains(position))
+                        })
+                });
+                if click_outside {
+                    self.timezone_picker_open = false;
+                }
+            }
+            if let Some(index) = timezone_index(&self.selected_timezone) {
+                self.shared_timezone.store(index, Ordering::Relaxed);
+            }
 
             if ui
                 .checkbox(&mut self.audio_enabled, "Output LTC to Audio Jack")
@@ -419,7 +521,7 @@ fn timezone_index(name: &str) -> Option<usize> {
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([360.0, 220.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([360.0, 500.0]),
         ..Default::default()
     };
     eframe::run_native(
