@@ -157,7 +157,7 @@ fn synchronize_once(
 
             if let Some(time) = ntp_sys.map(DateTime::<Utc>::from) {
                 store_time_at_base(offset_ms, time, base_instant);
-                set_ntp_status(status_text, "NTP Locked (pool.ntp.org)");
+                set_ntp_status(status_text, "NTP: Locked");
                 true
             } else {
                 use_system_time_fallback(

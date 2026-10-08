@@ -42,12 +42,12 @@ mod tests {
     fn successful_sync_and_audio_enable_status_reads_as_expected() {
         let status_text = Mutex::new(StatusText::new("NTP: Syncing"));
 
-        set_ntp_status(&status_text, "NTP Locked (pool.ntp.org)");
+        set_ntp_status(&status_text, "NTP: Locked");
         set_audio_status(&status_text, "Audio output stream is playing");
 
         assert_eq!(
             status_text.lock().unwrap().combined(),
-            "NTP Locked (pool.ntp.org) | Audio output: Audio output stream is playing"
+            "NTP: Locked | Audio output: Audio output stream is playing"
         );
     }
 }
