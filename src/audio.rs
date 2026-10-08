@@ -140,94 +140,80 @@ fn initialize_audio_stream(
     }
     let (device, device_id) = device
         .ok_or_else(|| "The default audio output device is no longer available".to_owned())?;
-    let config = device
+    let default_config = device
         .default_output_config()
         .map_err(|error| format!("Could not read audio output config: {error}"))?;
+    let config = device
+        .supported_output_configs()
+        .ok()
+        .and_then(|configs| {
+            configs
+                .filter(|config| config.sample_format() == cpal::SampleFormat::F32)
+                .min_by_key(|config| {
+                    (
+                        config.channels() != default_config.channels(),
+                        !(config.min_sample_rate() <= default_config.sample_rate()
+                            && default_config.sample_rate() <= config.max_sample_rate()),
+                    )
+                })
+                .map(|config| {
+                    config
+                        .try_with_sample_rate(default_config.sample_rate())
+                        .unwrap_or_else(|| config.with_max_sample_rate())
+                })
+        })
+        .unwrap_or(default_config);
     let sample_rate = config.sample_rate();
     let channels = usize::from(config.channels());
     if channels == 0 {
         return Err("Audio output config has zero channels".to_owned());
     }
-    let stream_config = config.into();
+    let stream_config = config.config();
+    let sample_format = config.sample_format();
     let shared_fps = shared.fps.clone();
     let shared_timezone = shared.timezone.clone();
     let shared_enabled_flag = shared.enabled.clone();
-    let shared_volume_dbfs = shared.volume_dbfs.clone();
     let offset_ms = shared.offset_ms.clone();
     let base_instant = shared.local_base;
     let stream_error = shared.stream_error.clone();
-    let mut generator_fps = SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
-    let mut ltc_gen = LtcBiphaseMarkGenerator::new(sample_rate, generator_fps);
-    let mut frame_clock = LtcFrameClock::new(sample_rate, generator_fps);
-    let mut samples_until_frame_boundary = 0;
-    let mut mono_scratch = Vec::new();
-
-    device
-        .build_output_stream(
-            stream_config,
-            move |data: &mut [f32], _| {
-                if !shared_enabled_flag.load(Ordering::Relaxed) {
-                    data.fill(0.0);
-                    samples_until_frame_boundary = 0;
-                    return;
-                }
-
-                let fps = SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
-                if fps != generator_fps {
-                    ltc_gen = LtcBiphaseMarkGenerator::new(sample_rate, fps);
-                    frame_clock = LtcFrameClock::new(sample_rate, fps);
-                    generator_fps = fps;
-                    samples_until_frame_boundary = 0;
-                }
-
-                let offset = offset_ms.load(Ordering::Relaxed);
-                let callback_elapsed = base_instant.elapsed();
-                let timezone_index = shared_timezone.load(Ordering::Relaxed) % TZ_VARIANTS.len();
-                let audio_frames = data.len() / channels;
-
-                if channels == 1 {
-                    generate_ltc_frames(
-                        &mut data[..audio_frames],
-                        &mut ltc_gen,
-                        &mut frame_clock,
-                        &mut samples_until_frame_boundary,
-                        sample_rate,
-                        callback_elapsed,
-                        offset,
-                        timezone_index,
-                        fps,
-                    );
-                } else {
-                    mono_scratch.resize(audio_frames, 0.0);
-                    generate_ltc_frames(
-                        &mut mono_scratch,
-                        &mut ltc_gen,
-                        &mut frame_clock,
-                        &mut samples_until_frame_boundary,
-                        sample_rate,
-                        callback_elapsed,
-                        offset,
-                        timezone_index,
-                        fps,
-                    );
-                    duplicate_mono_samples(
-                        &mono_scratch,
-                        &mut data[..audio_frames * channels],
-                        channels,
-                    );
-                    data[audio_frames * channels..].fill(0.0);
-                }
-
-                let gain = 10.0_f32.powf(shared_volume_dbfs.load(Ordering::Relaxed) as f32 / 20.0);
-                for sample in data.iter_mut() {
-                    *sample *= gain;
-                }
-            },
-            move |_| {
-                stream_error.store(true, Ordering::Relaxed);
-            },
-            None,
-        )
+    let shared_volume_dbfs = shared.volume_dbfs.clone();
+    macro_rules! build_stream {
+        ($sample_type:ty) => {
+            build_typed_output_stream::<$sample_type>(
+                &device,
+                stream_config,
+                sample_rate,
+                channels,
+                shared_fps.clone(),
+                shared_timezone.clone(),
+                shared_enabled_flag.clone(),
+                shared_volume_dbfs.clone(),
+                offset_ms.clone(),
+                base_instant,
+                stream_error.clone(),
+            )
+        };
+    }
+    let stream = match sample_format {
+        cpal::SampleFormat::F32 => build_stream!(f32),
+        cpal::SampleFormat::F64 => build_stream!(f64),
+        cpal::SampleFormat::I8 => build_stream!(i8),
+        cpal::SampleFormat::I16 => build_stream!(i16),
+        cpal::SampleFormat::I24 => build_stream!(cpal::I24),
+        cpal::SampleFormat::I32 => build_stream!(i32),
+        cpal::SampleFormat::I64 => build_stream!(i64),
+        cpal::SampleFormat::U8 => build_stream!(u8),
+        cpal::SampleFormat::U16 => build_stream!(u16),
+        cpal::SampleFormat::U24 => build_stream!(cpal::U24),
+        cpal::SampleFormat::U32 => build_stream!(u32),
+        cpal::SampleFormat::U64 => build_stream!(u64),
+        unsupported => {
+            return Err(format!(
+                "Unsupported audio output sample format: {unsupported}"
+            ));
+        }
+    };
+    stream
         .map(|stream| (stream, device_id))
         .map_err(|error| format!("Could not build audio output stream: {error}"))
         .and_then(|(stream, device_id)| {
@@ -236,6 +222,98 @@ fn initialize_audio_stream(
                 .map(|()| (stream, device_id))
                 .map_err(|error| format!("Could not start audio output stream: {error}"))
         })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_typed_output_stream<T>(
+    device: &cpal::Device,
+    stream_config: cpal::StreamConfig,
+    sample_rate: u32,
+    channels: usize,
+    shared_fps: Arc<AtomicU8>,
+    shared_timezone: Arc<AtomicUsize>,
+    shared_enabled_flag: Arc<AtomicBool>,
+    shared_volume_dbfs: Arc<AtomicI32>,
+    offset_ms: Arc<AtomicI64>,
+    base_instant: Instant,
+    stream_error: Arc<AtomicBool>,
+) -> Result<cpal::Stream, cpal::Error>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32>,
+{
+    let mut generator_fps = SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
+    let mut ltc_gen = LtcBiphaseMarkGenerator::new(sample_rate, generator_fps);
+    let mut frame_clock = LtcFrameClock::new(sample_rate, generator_fps);
+    let mut samples_until_frame_boundary = 0;
+    let mut mono_scratch = Vec::new();
+    let mut sample_scratch = Vec::new();
+
+    device.build_output_stream(
+        stream_config,
+        move |data: &mut [T], _| {
+            sample_scratch.resize(data.len(), 0.0);
+            if !shared_enabled_flag.load(Ordering::Relaxed) {
+                data.fill(T::from_sample(0.0));
+                samples_until_frame_boundary = 0;
+                return;
+            }
+
+            let fps = SelectedFps::from_u8(shared_fps.load(Ordering::Relaxed));
+            if fps != generator_fps {
+                ltc_gen = LtcBiphaseMarkGenerator::new(sample_rate, fps);
+                frame_clock = LtcFrameClock::new(sample_rate, fps);
+                generator_fps = fps;
+                samples_until_frame_boundary = 0;
+            }
+
+            let offset = offset_ms.load(Ordering::Relaxed);
+            let callback_elapsed = base_instant.elapsed();
+            let timezone_index = shared_timezone.load(Ordering::Relaxed) % TZ_VARIANTS.len();
+            let audio_frames = sample_scratch.len() / channels;
+
+            if channels == 1 {
+                generate_ltc_frames(
+                    &mut sample_scratch[..audio_frames],
+                    &mut ltc_gen,
+                    &mut frame_clock,
+                    &mut samples_until_frame_boundary,
+                    sample_rate,
+                    callback_elapsed,
+                    offset,
+                    timezone_index,
+                    fps,
+                );
+            } else {
+                mono_scratch.resize(audio_frames, 0.0);
+                generate_ltc_frames(
+                    &mut mono_scratch,
+                    &mut ltc_gen,
+                    &mut frame_clock,
+                    &mut samples_until_frame_boundary,
+                    sample_rate,
+                    callback_elapsed,
+                    offset,
+                    timezone_index,
+                    fps,
+                );
+                duplicate_mono_samples(
+                    &mono_scratch,
+                    &mut sample_scratch[..audio_frames * channels],
+                    channels,
+                );
+                sample_scratch[audio_frames * channels..].fill(0.0);
+            }
+
+            let gain = 10.0_f32.powf(shared_volume_dbfs.load(Ordering::Relaxed) as f32 / 20.0);
+            for (output, sample) in data.iter_mut().zip(sample_scratch.iter()) {
+                *output = T::from_sample(*sample * gain);
+            }
+        },
+        move |_| {
+            stream_error.store(true, Ordering::Relaxed);
+        },
+        None,
+    )
 }
 
 fn current_default_output_device_id(host: &cpal::Host) -> Result<Option<String>, String> {
