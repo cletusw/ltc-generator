@@ -95,6 +95,10 @@ pub struct LtcApp {
 
 impl Default for LtcApp {
     fn default() -> Self {
+        let local_base = Instant::now();
+        let offset_ms = Arc::new(AtomicI64::new(0));
+        store_time_at_base(&offset_ms, Utc::now(), local_base);
+
         Self {
             selected_fps: SelectedFps::Fps2997Df,
             selected_timezone: system_timezone_name(),
@@ -110,8 +114,8 @@ impl Default for LtcApp {
             )),
             shared_enabled: Arc::new(AtomicBool::new(true)),
             shared_volume_dbfs: Arc::new(AtomicI32::new(-18)),
-            offset_ms: Arc::new(AtomicI64::new(0)),
-            local_base: Instant::now(),
+            offset_ms,
+            local_base,
             status_text: Arc::new(Mutex::new("Syncing via OxiMedia NTP...".into())),
             _stream: None,
         }
@@ -127,6 +131,7 @@ impl LtcApp {
         };
 
         app.local_base = Instant::now();
+        store_time_at_base(&app.offset_ms, Utc::now(), app.local_base);
         app.shared_fps
             .store(app.selected_fps as u8, Ordering::Relaxed);
         if timezone_index(&app.selected_timezone).is_none() {
@@ -144,6 +149,7 @@ impl LtcApp {
 
         let offset_clone = app.offset_ms.clone();
         let status_clone = app.status_text.clone();
+        let base_instant = app.local_base;
 
         // Background NTP Sync
         std::thread::spawn(move || {
@@ -211,7 +217,7 @@ impl LtcApp {
                             };
 
                             if let Some(time) = ntp_sys.map(DateTime::<Utc>::from) {
-                                offset_clone.store(time.timestamp_millis(), Ordering::Relaxed);
+                                store_time_at_base(&offset_clone, time, base_instant);
                                 if let Ok(mut status) = status_clone.lock() {
                                     *status = "NTP Locked (pool.ntp.org)".into();
                                 }
@@ -219,17 +225,23 @@ impl LtcApp {
                                 use_system_time_fallback(
                                     &offset_clone,
                                     &status_clone,
+                                    base_instant,
                                     "invalid NTP time adjustment",
                                 );
                             }
                         }
                         Err(e) => {
-                            use_system_time_fallback(&offset_clone, &status_clone, &e);
+                            use_system_time_fallback(
+                                &offset_clone,
+                                &status_clone,
+                                base_instant,
+                                &e,
+                            );
                         }
                     }
                 }
                 Err(e) => {
-                    use_system_time_fallback(&offset_clone, &status_clone, &e);
+                    use_system_time_fallback(&offset_clone, &status_clone, base_instant, &e);
                 }
             }
         });
@@ -319,14 +331,25 @@ impl LtcApp {
 fn use_system_time_fallback(
     offset_ms: &AtomicI64,
     status_text: &Mutex<String>,
+    base_instant: Instant,
     error: impl std::fmt::Display,
 ) {
-    offset_ms.store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+    store_time_at_base(offset_ms, Utc::now(), base_instant);
     let status = format!("NTP Sync Error: {}; falling back to system time", error);
 
     if let Ok(mut current_status) = status_text.lock() {
         *current_status = status;
     }
+}
+
+fn store_time_at_base(offset_ms: &AtomicI64, time: DateTime<Utc>, base_instant: Instant) {
+    let elapsed_ms = i64::try_from(base_instant.elapsed().as_millis())
+        .expect("elapsed time exceeds timestamp range");
+    let timestamp_at_base = time
+        .timestamp_millis()
+        .checked_sub(elapsed_ms)
+        .expect("timestamp at monotonic base is out of range");
+    offset_ms.store(timestamp_at_base, Ordering::Relaxed);
 }
 
 impl eframe::App for LtcApp {
