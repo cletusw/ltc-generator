@@ -461,7 +461,7 @@ fn audio_output_control(
 
 pub(crate) fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([360.0, 500.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([500.0, 300.0]),
         ..Default::default()
     };
     eframe::run_native(
