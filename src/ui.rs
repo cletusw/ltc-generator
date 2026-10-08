@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicUsize,
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+const APP_NAME: &str = "LTC Generator w/ NTP";
+
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct LtcApp {
@@ -157,7 +159,7 @@ impl eframe::App for LtcApp {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("OxiMedia NTP LTC Generator");
+            ui.heading(APP_NAME);
 
             // Standard Mutex safe-lock for UI
             if let Ok(status) = self.status_text.lock() {
@@ -415,7 +417,7 @@ pub(crate) fn run() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "NTP LTC Generator",
+        APP_NAME,
         options,
         Box::new(|cc| Ok(Box::new(LtcApp::new(cc)))),
     )
