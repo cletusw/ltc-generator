@@ -253,5 +253,26 @@ mod tests {
                 .iter()
                 .all(|sample| *sample == -1.0 || *sample == 1.0)
         );
+
+        let timecode = Timecode::from_frames(0, fps.to_oximedia_fps())
+            .expect("frame zero is a valid timecode");
+        let bits = LtcBitEncoder::encode(&timecode);
+        let samples_per_bit = 48_000 / (80 * 25);
+        assert_eq!(samples_per_bit, 24);
+        for (bit_index, bit) in bits.iter().enumerate() {
+            let bit_start = bit_index * samples_per_bit;
+            if bit_start == 0 {
+                assert_eq!(samples[bit_start], -1.0);
+            } else {
+                assert_eq!(samples[bit_start], -samples[bit_start - 1]);
+            }
+
+            let midpoint = bit_start + samples_per_bit / 2;
+            assert_eq!(
+                samples[midpoint] != samples[midpoint - 1],
+                *bit == 1,
+                "unexpected biphase-mark midpoint transition for bit {bit_index}"
+            );
+        }
     }
 }
